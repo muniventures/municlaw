@@ -1,0 +1,35 @@
+# Build and tooling
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+**/coverage/
+**/TestResults/
+.dotnet-home/
+.vs/
+.idea/
+*.user
+*.suo
+*.tsbuildinfo
+.DS_Store
+
+# Local data and credentials
+.env
+.env.*
+!.env.example
+**/appsettings.Development.json
+**/appsettings.Local.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.pem
+*.key
+*.pfx
+*.p12
+*.log
+local/
+.local/
+artifacts/
+scripts/temp/*
+!scripts/temp/README.md
