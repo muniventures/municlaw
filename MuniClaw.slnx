@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/modules/">
+    <Project Path="modules/api/MuniClaw.Api.csproj" />
+    <Project Path="modules/core/MuniClaw.Core.csproj" />
+    <Project Path="modules/worker/MuniClaw.Worker.csproj" />
+    <Project Path="modules/tests/MuniClaw.Tests/MuniClaw.Tests.csproj" />
+    <Project Path="modules/tests/MuniClaw.Worker.Tests/MuniClaw.Worker.Tests.csproj" />
+  </Folder>
+</Solution>
