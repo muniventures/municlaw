@@ -271,3 +271,45 @@ export interface DiffPayload {
   headCommitSha: string;
   files: DiffFileChange[];
 }
+
+// Notification Channels and Webhooks
+export type NotificationChannelType = "Slack" | "Discord" | "GenericWebhook";
+
+export type NotificationEventType =
+  | "ApprovalRequested"
+  | "TaskCompleted"
+  | "TaskFailed"
+  | "DeliveryPublished";
+
+export interface NotificationChannel {
+  id: string;
+  organizationId: string;
+  channelType: NotificationChannelType;
+  name: string;
+  maskedWebhookUrl: string;
+  subscribedEvents: NotificationEventType[];
+  isEnabled: boolean;
+  createdAt: string;
+  lastDispatchedAt?: string;
+  lastDispatchStatus?: string;
+  hasSigningSecret?: boolean;
+}
+
+export interface CreateNotificationChannelRequest {
+  name: string;
+  channelType: NotificationChannelType;
+  webhookUrl: string;
+  subscribedEvents: NotificationEventType[];
+  isEnabled?: boolean;
+  signingSecret?: string;
+}
+
+export interface UpdateNotificationChannelRequest {
+  name?: string;
+  channelType?: NotificationChannelType;
+  webhookUrl?: string;
+  subscribedEvents?: NotificationEventType[];
+  isEnabled?: boolean;
+  signingSecret?: string;
+}
+

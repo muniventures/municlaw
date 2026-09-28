@@ -1,5 +1,6 @@
 using MuniClaw.Core.Contracts.Approvals;
 using MuniClaw.Core.Contracts.Harness;
+using MuniClaw.Core.Contracts.Notifications;
 using MuniClaw.Core.Contracts.Tasks;
 using MuniClaw.Core.Contracts.Worker;
 using MuniClaw.Core.Data;
@@ -1205,6 +1206,158 @@ public static class Program
                 Assert(!ex.ToString().Contains(sensitiveToken), "Vault auth token must be redacted from all exception messages");
             }
             Assert(threw, "Unreachable vault endpoint throws exception");
+        });
+
+        // --- T90 Outbound Messaging Adapters & Webhooks Qualification Tests ---
+
+        await RunAsyncTest("T90: Messaging: Slack Block Kit payload formatting and action button URL", async () =>
+        {
+            var notif = new TaskLifecycleNotification
+            {
+                EventType = NotificationEventType.ApprovalRequested,
+                TaskId = Guid.NewGuid(),
+                RunId = Guid.NewGuid(),
+                OrganizationId = Guid.NewGuid(),
+                TaskTitle = "Refactor Authentication Middleware",
+                RepositoryName = "muniventures/municlaw",
+                Branch = "task/auth-refactor",
+                Timestamp = DateTimeOffset.UtcNow,
+                Summary = "Worker requesting approval to execute shell command: npm run test",
+                ConsoleUrl = "https://ai.muni.dev/tasks/123"
+            };
+
+            var slackJson = NotificationPayloadFormatter.FormatSlack(notif);
+            Assert(slackJson.Contains("blocks"), "Slack payload must contain blocks array");
+            Assert(slackJson.Contains("View in Console"), "Slack payload must contain View in Console button");
+            Assert(slackJson.Contains("https://ai.muni.dev/tasks/123"), "Slack button must link to ConsoleUrl");
+            Assert(slackJson.Contains("task/auth-refactor"), "Slack payload must mention branch");
+            await Task.CompletedTask;
+        });
+
+        await RunAsyncTest("T90: Messaging: Discord Embed payload formatting and color coding", async () =>
+        {
+            var eventsAndColors = new[]
+            {
+                (NotificationEventType.ApprovalRequested, 0xF59E0B),
+                (NotificationEventType.TaskCompleted, 0x10B981),
+                (NotificationEventType.TaskFailed, 0xEF4444),
+                (NotificationEventType.DeliveryPublished, 0x3B82F6)
+            };
+
+            foreach (var (evt, expectedColor) in eventsAndColors)
+            {
+                var notif = new TaskLifecycleNotification
+                {
+                    EventType = evt,
+                    TaskId = Guid.NewGuid(),
+                    RunId = Guid.NewGuid(),
+                    OrganizationId = Guid.NewGuid(),
+                    TaskTitle = "Test Task",
+                    RepositoryName = "repo",
+                    Branch = "main",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Summary = "Summary",
+                    ConsoleUrl = "https://ai.muni.dev"
+                };
+
+                var discordJson = NotificationPayloadFormatter.FormatDiscord(notif);
+                Assert(discordJson.Contains("embeds"), "Discord payload must contain embeds array");
+                Assert(discordJson.Contains(expectedColor.ToString()), $"Discord embed for {evt} must contain color {expectedColor}");
+            }
+            await Task.CompletedTask;
+        });
+
+        await RunAsyncTest("T90: Messaging: Generic Webhook HMAC-SHA256 signature verification and tamper detection", async () =>
+        {
+            var secret = "whsec_super-secret-signing-key-1234567890";
+            var payload = "{\"event\":\"TaskCompleted\",\"taskId\":\"12345\"}";
+            var timestamp = 1769600000L;
+
+            var sig1 = NotificationPayloadFormatter.ComputeHmacSignature(secret, payload, timestamp);
+            Assert(sig1.Length == 64, "HMAC-SHA256 hex string must be exactly 64 characters");
+
+            // Same input must produce identical signature (idempotent verification)
+            var sig2 = NotificationPayloadFormatter.ComputeHmacSignature(secret, payload, timestamp);
+            Assert(sig1 == sig2, "Identical inputs must yield identical HMAC signature");
+
+            // Tampering payload must alter signature
+            var tamperedSig = NotificationPayloadFormatter.ComputeHmacSignature(secret, payload + " ", timestamp);
+            Assert(sig1 != tamperedSig, "Tampered payload must fail HMAC signature match");
+
+            // Tampering timestamp must alter signature
+            var tamperedTimestampSig = NotificationPayloadFormatter.ComputeHmacSignature(secret, payload, timestamp + 1);
+            Assert(sig1 != tamperedTimestampSig, "Tampered timestamp must fail HMAC signature match");
+
+            // Wrong secret must fail signature match
+            var wrongSecretSig = NotificationPayloadFormatter.ComputeHmacSignature("wrong-secret", payload, timestamp);
+            Assert(sig1 != wrongSecretSig, "Wrong secret must fail HMAC signature match");
+
+            await Task.CompletedTask;
+        });
+
+        await RunAsyncTest("T90: Messaging: NotificationChannel registration, masking, and event subscription filtering", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var notifService = new NotificationService(store);
+
+            var (orgId, adminId, _, _) = await SetupOrgProjectAndCredential(store, auth);
+
+            // 1. Create Slack channel subscribed ONLY to TaskCompleted
+            var slackChannel = await notifService.CreateChannelAsync(orgId, new CreateNotificationChannelRequest(
+                "Engineering Alerts",
+                NotificationChannelType.Slack,
+                "https://hooks.slack.com/services/T0000/B0000/XXXXXXSecretToken",
+                new List<NotificationEventType> { NotificationEventType.TaskCompleted }
+            ), default);
+
+            Assert(slackChannel.Id != Guid.Empty, "Channel ID generated");
+            Assert(slackChannel.IsEnabled, "Channel enabled by default");
+
+            // 2. Create Discord channel subscribed ONLY to TaskFailed
+            var discordChannel = await notifService.CreateChannelAsync(orgId, new CreateNotificationChannelRequest(
+                "Ops Incidents",
+                NotificationChannelType.Discord,
+                "https://discord.com/api/webhooks/12345/TokenABC",
+                new List<NotificationEventType> { NotificationEventType.TaskFailed }
+            ), default);
+
+            // 3. Verify URL masking
+            var channels = await notifService.ListChannelsAsync(orgId, default);
+            Assert(channels.Count == 2, "2 channels registered");
+
+            var slackDto = new NotificationChannelDto(
+                slackChannel.Id,
+                slackChannel.OrganizationId,
+                slackChannel.ChannelType,
+                slackChannel.Name,
+                NotificationChannelDto.MaskWebhookUrl(slackChannel.WebhookUrl),
+                slackChannel.SubscribedEvents,
+                slackChannel.IsEnabled,
+                slackChannel.CreatedAt,
+                slackChannel.LastDispatchedAt,
+                slackChannel.LastDispatchStatus
+            );
+            Assert(!slackDto.MaskedWebhookUrl.Contains("XXXXXXSecretToken"), "Webhook token must be masked in DTO");
+            Assert(slackDto.MaskedWebhookUrl.Contains("***"), "Masked URL must contain ***");
+
+            // 4. Update channel: disable Discord channel
+            await notifService.UpdateChannelAsync(orgId, discordChannel.Id, new UpdateNotificationChannelRequest(
+                "Ops Incidents",
+                null,
+                new List<NotificationEventType> { NotificationEventType.TaskFailed },
+                false, // disable
+                null
+            ), default);
+
+            var updatedDiscord = await notifService.GetChannelAsync(orgId, discordChannel.Id, default);
+            Assert(!updatedDiscord!.IsEnabled, "Discord channel must now be disabled");
+
+            // 5. Delete Slack channel
+            var deleted = await notifService.DeleteChannelAsync(orgId, slackChannel.Id, default);
+            Assert(deleted, "Channel deleted successfully");
+            var remaining = await notifService.ListChannelsAsync(orgId, default);
+            Assert(remaining.Count == 1, "Only 1 channel remains after deletion");
         });
 
         Console.WriteLine("\n-------------------------------------------------");
