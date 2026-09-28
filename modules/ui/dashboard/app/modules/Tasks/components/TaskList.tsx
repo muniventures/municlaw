@@ -178,6 +178,8 @@ export function TaskList({
             const latestRun = task.runs?.[task.runs.length - 1];
             const queuePos = latestRun?.queuePosition ?? task.queuePosition;
             const runStatus = latestRun?.status ?? (queuePos ? "Queued" : undefined);
+            const harness = latestRun?.harnessType ?? task.harnessType;
+            const harnessLabel = harness === "ClaudeCode" ? "[Claude Code]" : "[OpenCode]";
             return (
               <Link
                 key={task.id}
@@ -198,6 +200,12 @@ export function TaskList({
                         {task.taskBranch}
                       </span>
                       <span>Base: {task.baseBranch}</span>
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] font-mono px-1.5 py-0 border-border bg-muted/40 text-foreground font-medium"
+                      >
+                        {harnessLabel}
+                      </Badge>
                       {latestRun?.resolvedModel && (
                         <span className="px-1.5 py-0.5 rounded bg-muted text-foreground text-[11px]">
                           {latestRun.resolvedModel}

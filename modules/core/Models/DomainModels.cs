@@ -23,9 +23,16 @@ public sealed class Organization
     public ICollection<Project> Projects { get; set; } = new List<Project>();
 }
 
+public enum HarnessType
+{
+    OpenCode = 0,
+    ClaudeCode = 1
+}
+
 public sealed partial class TaskRun
 {
     public int? QueuePosition { get; set; }
+    public HarnessType HarnessType { get; set; } = HarnessType.OpenCode;
 }
 
 public enum MembershipRole

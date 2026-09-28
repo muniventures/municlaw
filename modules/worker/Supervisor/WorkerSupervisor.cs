@@ -16,7 +16,7 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
     private readonly WorkerOptions _options;
     private readonly IWorkerApiClient _apiClient;
     private readonly ITaskSandboxManager _sandboxManager;
-    private readonly IOpenCodeSupervisor _harnessSupervisor;
+    private readonly IHarnessRegistry _harnessRegistry;
     private readonly IWorkerEventBuffer _eventBuffer;
     private readonly ILogger<WorkerSupervisor> _logger;
 
@@ -31,6 +31,23 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
     public string? CurrentLeaseToken => _currentLeaseToken;
     public long CurrentFencingToken => _currentFencingToken;
     public long LastCommandCursor => _lastCommandCursor;
+    public IHarnessRegistry HarnessRegistry => _harnessRegistry;
+
+    public WorkerSupervisor(
+        WorkerOptions options,
+        IWorkerApiClient apiClient,
+        ITaskSandboxManager sandboxManager,
+        IHarnessRegistry harnessRegistry,
+        IWorkerEventBuffer? eventBuffer = null,
+        ILogger<WorkerSupervisor>? logger = null)
+    {
+        _options = options;
+        _apiClient = apiClient;
+        _sandboxManager = sandboxManager;
+        _harnessRegistry = harnessRegistry;
+        _eventBuffer = eventBuffer ?? new WorkerEventBuffer(options.MaxBufferedEvents);
+        _logger = logger ?? NullLogger<WorkerSupervisor>.Instance;
+    }
 
     public WorkerSupervisor(
         WorkerOptions options,
@@ -39,13 +56,15 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
         IOpenCodeSupervisor harnessSupervisor,
         IWorkerEventBuffer? eventBuffer = null,
         ILogger<WorkerSupervisor>? logger = null)
+        : this(options, apiClient, sandboxManager, CreateRegistryWithOpenCode(harnessSupervisor), eventBuffer, logger)
     {
-        _options = options;
-        _apiClient = apiClient;
-        _sandboxManager = sandboxManager;
-        _harnessSupervisor = harnessSupervisor;
-        _eventBuffer = eventBuffer ?? new WorkerEventBuffer(options.MaxBufferedEvents);
-        _logger = logger ?? NullLogger<WorkerSupervisor>.Instance;
+    }
+
+    private static IHarnessRegistry CreateRegistryWithOpenCode(IOpenCodeSupervisor supervisor)
+    {
+        var registry = new HarnessRegistry();
+        registry.Register(supervisor);
+        return registry;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -110,6 +129,13 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
         var fencingToken = claim.FencingToken;
         var initialLeaseToken = claim.LeaseToken ?? string.Empty;
 
+        // Dynamically resolve harness supervisor using claim.HarnessType.ToString()
+        var harnessSupervisor = _harnessRegistry.GetSupervisor(claim.HarnessType.ToString());
+        if (!harnessSupervisor.IsRunning)
+        {
+            await harnessSupervisor.StartAsync(supervisorCt);
+        }
+
         _isActive = true;
         _currentRunId = runId;
         _currentFencingToken = fencingToken;
@@ -117,8 +143,8 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
         _lastCommandCursor = 0;
         _eventBuffer.Reset();
 
-        _logger.LogInformation("Claimed work for Task {TaskId}, Run {RunId}. FencingToken={FencingToken}",
-            taskId, runId, fencingToken);
+        _logger.LogInformation("Claimed work for Task {TaskId}, Run {RunId}. Harness={HarnessType}, FencingToken={FencingToken}",
+            taskId, runId, harnessSupervisor.HarnessType, fencingToken);
 
         using var runCts = CancellationTokenSource.CreateLinkedTokenSource(supervisorCt);
         var leaseLost = false;
@@ -135,7 +161,7 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
         HarnessSessionInfo? session = null;
         try
         {
-            session = await _harnessSupervisor.Adapter.CreateSessionAsync(sandbox.WorktreeDirectory, runCts.Token);
+            session = await harnessSupervisor.Adapter.CreateSessionAsync(sandbox.WorktreeDirectory, runCts.Token);
             activeSessionId = session.SessionId;
 
             _eventBuffer.Enqueue(taskId, runId, TaskEventType.StepStarted,
@@ -182,7 +208,7 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
                 {
                     foreach (var cmd in initialHb.PendingCommands.OrderBy(c => c.CommandSequence))
                     {
-                        await HandleCommandAsync(cmd, activeSessionId, runCts);
+                        await HandleCommandAsync(cmd, activeSessionId, harnessSupervisor.Adapter, runCts);
                         _lastCommandCursor = Math.Max(_lastCommandCursor, cmd.CommandSequence);
                     }
                 }
@@ -231,7 +257,7 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
                     {
                         foreach (var cmd in hbResp.PendingCommands.OrderBy(c => c.CommandSequence))
                         {
-                            await HandleCommandAsync(cmd, activeSessionId, runCts);
+                            await HandleCommandAsync(cmd, activeSessionId, harnessSupervisor.Adapter, runCts);
                             _lastCommandCursor = Math.Max(_lastCommandCursor, cmd.CommandSequence);
                         }
                     }
@@ -251,9 +277,9 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
         try
         {
             // Stream harness events while active
-            await foreach (var rawEvt in _harnessSupervisor.Adapter.SubscribeEventsAsync(runCts.Token))
+            await foreach (var rawEvt in harnessSupervisor.Adapter.SubscribeEventsAsync(runCts.Token))
             {
-                var canonical = HarnessEventMapper.MapToCanonical(rawEvt.EventType);
+                var canonical = MapHarnessEvent(harnessSupervisor.HarnessType, rawEvt);
                 if (canonical.HasValue)
                 {
                     _eventBuffer.Enqueue(taskId, runId, canonical.Value, rawEvt.PayloadJson, rawEvt.Timestamp);
@@ -299,7 +325,7 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
         CleanupRunState();
     }
 
-    private async Task HandleCommandAsync(WorkerCommand cmd, string? sessionId, CancellationTokenSource runCts)
+    private async Task HandleCommandAsync(WorkerCommand cmd, string? sessionId, IHarnessAdapter adapter, CancellationTokenSource runCts)
     {
         _logger.LogInformation("Handling worker command {Type} (Seq {Seq})", cmd.CommandType, cmd.CommandSequence);
 
@@ -309,7 +335,7 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
             case WorkerCommandType.Cancel:
                 if (!string.IsNullOrEmpty(sessionId))
                 {
-                    await _harnessSupervisor.Adapter.AbortAsync(sessionId, default);
+                    await adapter.AbortAsync(sessionId, default);
                 }
                 runCts.Cancel();
                 break;
@@ -319,6 +345,28 @@ public sealed class WorkerSupervisor : BackgroundService, IWorkerSupervisor
                 // Reconcile/resume hooks
                 break;
         }
+    }
+
+    private static TaskEventType? MapHarnessEvent(string harnessType, HarnessRawEvent rawEvt)
+    {
+        TaskEventType? canonical = string.Equals(harnessType, "ClaudeCode", StringComparison.OrdinalIgnoreCase)
+            ? ClaudeCodeEventMapper.MapToCanonical(rawEvt.EventType)
+            : HarnessEventMapper.MapToCanonical(rawEvt.EventType);
+
+        if (!canonical.HasValue)
+        {
+            if (Enum.TryParse<TaskEventType>(rawEvt.EventType, true, out var direct))
+            {
+                canonical = direct;
+            }
+            else
+            {
+                canonical = ClaudeCodeEventMapper.MapToCanonical(rawEvt.EventType)
+                    ?? HarnessEventMapper.MapToCanonical(rawEvt.EventType);
+            }
+        }
+
+        return canonical;
     }
 
     private async Task FlushEventsSafelyAsync(Guid runId, long fencingToken, CancellationToken ct)

@@ -503,6 +503,179 @@ public static class Program
             }
         });
 
+        // 13. T90: Harness: ClaudeCodeEventMapper canonical event mapping
+        RunTest("T90: Harness: ClaudeCodeEventMapper canonical event mapping", () =>
+        {
+            Assert(ClaudeCodeEventMapper.MapToCanonical("text_delta") == TaskEventType.TextDelta, "text_delta -> TextDelta");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("thought_delta") == TaskEventType.ReasoningDelta, "thought_delta -> ReasoningDelta");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("tool_call") == TaskEventType.ToolCalled, "tool_call -> ToolCalled");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("tool_result") == TaskEventType.ToolSuccess, "tool_result -> ToolSuccess");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("tool_result", false) == TaskEventType.ToolFailed, "tool_result failed -> ToolFailed");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("diff") == TaskEventType.DiffUpdated, "diff -> DiffUpdated");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("ask_user") == TaskEventType.ApprovalRequested, "ask_user -> ApprovalRequested");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("error") == TaskEventType.Error, "error -> Error");
+            Assert(ClaudeCodeEventMapper.MapToCanonical("unknown_event_xyz") == null, "unknown -> null");
+        });
+
+        // 14. T90: Harness: ClaudeCodeHarnessAdapter session, prompt, and diff
+        await RunAsyncTest("T90: Harness: ClaudeCodeHarnessAdapter session, prompt, and diff", async () =>
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), "claude-session-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            try
+            {
+                using var adapter = new ClaudeCodeHarnessAdapter();
+                var session = await adapter.CreateSessionAsync(tempDir, default);
+                Assert(!string.IsNullOrEmpty(session.SessionId), "SessionId generated");
+                Assert(session.Directory == tempDir, "Working directory matches");
+                Assert(session.Version == "1.0.0", "Version matches PinnedVersion");
+
+                var prompt = new HarnessPrompt
+                {
+                    Parts = new[] { new HarnessPromptPart { Type = "text", Text = "Implement unit test" } },
+                    Model = new HarnessModelSpec { ProviderId = "anthropic", ModelId = "claude-3-7-sonnet" }
+                };
+
+                await adapter.SendPromptAsync(session.SessionId, prompt, default);
+
+                // Verify events can be subscribed
+                using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+                var eventCount = 0;
+                await foreach (var evt in adapter.SubscribeEventsAsync(cts.Token))
+                {
+                    eventCount++;
+                    Assert(!string.IsNullOrEmpty(evt.EventType), "Event has type");
+                    if (eventCount >= 3) break;
+                }
+                Assert(eventCount > 0, "Received events from ClaudeCodeHarnessAdapter");
+
+                // Verify diff retrieval
+                var diff = await adapter.GetDiffAsync(session.SessionId, default);
+                Assert(diff != null, "GetDiffAsync returns list");
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+            }
+        });
+
+        // 15. T90: Harness: ClaudeCodeHarnessAdapter sub-100ms abort
+        await RunAsyncTest("T90: Harness: ClaudeCodeHarnessAdapter sub-100ms abort", async () =>
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), "claude-abort-test-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDir);
+            try
+            {
+                using var adapter = new ClaudeCodeHarnessAdapter();
+                var session = await adapter.CreateSessionAsync(tempDir, default);
+
+                var sw = Stopwatch.StartNew();
+                var aborted = await adapter.AbortAsync(session.SessionId, default);
+                sw.Stop();
+
+                Assert(aborted, "AbortAsync returns true for active session");
+                Assert(sw.ElapsedMilliseconds < 100, $"Abort must execute within 100ms (took {sw.ElapsedMilliseconds}ms)");
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir)) Directory.Delete(tempDir, recursive: true);
+            }
+        });
+
+        // 16. T90: Harness: HarnessRegistry dynamic resolution and OpenCode fallback
+        RunTest("T90: Harness: HarnessRegistry dynamic resolution and OpenCode fallback", () =>
+        {
+            var registry = new HarnessRegistry();
+            var options = new WorkerOptions { OrganizationId = Guid.NewGuid() };
+            var openCode = new OpenCodeSupervisor(options, new MockOpenCodeProcessRunner());
+            var claudeCode = new ClaudeCodeSupervisor();
+
+            registry.Register(openCode);
+            registry.Register(claudeCode);
+
+            // Explicit resolution
+            var resolvedClaude = registry.GetSupervisor("ClaudeCode");
+            Assert(resolvedClaude.HarnessType == "ClaudeCode", "Resolves ClaudeCode supervisor");
+
+            var resolvedOpenCode = registry.GetSupervisor("OpenCode");
+            Assert(resolvedOpenCode.HarnessType == "OpenCode", "Resolves OpenCode supervisor");
+
+            // Unknown harness falls back to OpenCode
+            var fallback = registry.GetSupervisor("CustomUnknownHarness");
+            Assert(fallback.HarnessType == "OpenCode", "Unknown harness falls back to OpenCode");
+
+            // Empty/null falls back to OpenCode
+            var defaultHarness = registry.GetSupervisor(string.Empty);
+            Assert(defaultHarness.HarnessType == "OpenCode", "Empty string falls back to OpenCode");
+
+            Assert(registry.GetAllSupervisors().Count == 2, "2 supervisors registered");
+        });
+
+        // 17. T90: Supervisor: Routes work to ClaudeCode supervisor dynamically via registry
+        await RunAsyncTest("T90: Supervisor: Routes work to ClaudeCode supervisor dynamically via registry", async () =>
+        {
+            var tempRoot = Path.Combine(Path.GetTempPath(), "claude-sup-test-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var orgId = Guid.NewGuid();
+                var runId = Guid.NewGuid();
+                var taskId = Guid.NewGuid();
+
+                var options = new WorkerOptions
+                {
+                    OrganizationId = orgId,
+                    TasksRootPath = tempRoot,
+                    HeartbeatInterval = TimeSpan.FromMilliseconds(50),
+                    ClaimPollInterval = TimeSpan.FromMilliseconds(50)
+                };
+
+                var mockClient = new MockWorkerApiClient();
+                mockClient.EnqueueClaim(new WorkerClaimResponse
+                {
+                    HasWork = true,
+                    RunId = runId,
+                    TaskId = taskId,
+                    FencingToken = 15,
+                    LeaseToken = "claude-lease-1",
+                    HarnessType = MuniClaw.Core.Models.HarnessType.ClaudeCode,
+                    HarnessVersion = "claude-code"
+                });
+
+                // Immediate abort on first heartbeat to exit cleanly
+                mockClient.HeartbeatResponseFactory = req => new WorkerHeartbeatResponse
+                {
+                    IsLeaseValid = true,
+                    ExtendedLeaseToken = "claude-lease-ext",
+                    PendingCommands = new[]
+                    {
+                        new WorkerCommand
+                        {
+                            CommandSequence = 1,
+                            CommandType = WorkerCommandType.Abort,
+                            PayloadJson = "{}"
+                        }
+                    }
+                };
+
+                var sandboxMgr = new TaskSandboxManager(options);
+                var openCodeSup = new OpenCodeSupervisor(options, new MockOpenCodeProcessRunner());
+                var claudeCodeSup = new ClaudeCodeSupervisor();
+
+                var registry = new HarnessRegistry(new IHarnessSupervisor[] { openCodeSup, claudeCodeSup });
+                var supervisor = new WorkerSupervisor(options, mockClient, sandboxMgr, registry);
+
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                var processed = await supervisor.PollAndProcessOnceAsync(cts.Token);
+
+                Assert(processed, "PollAndProcessOnceAsync processed ClaudeCode task");
+                Assert(claudeCodeSup.IsRunning, "ClaudeCode supervisor was invoked and started");
+            }
+            finally
+            {
+                if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+            }
+        });
+
         Console.WriteLine("\n-------------------------------------------------");
         Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
         Console.WriteLine("-------------------------------------------------");

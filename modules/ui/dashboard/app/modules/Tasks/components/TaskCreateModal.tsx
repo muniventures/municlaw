@@ -13,7 +13,12 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import type { Project, ProviderCredentialReference } from "@/api/types";
+import type {
+  HarnessType,
+  CreateTaskRequest,
+  Project,
+  ProviderCredentialReference,
+} from "@/api/types";
 import { createTask, type CreateTaskPayload } from "@/api/tasks";
 import { getAccessibleCredentials } from "@/api/connections";
 
@@ -33,6 +38,11 @@ const SUPPORTED_MODELS = [
   { id: "gpt-4o", name: "OpenAI GPT-4o" },
   { id: "gpt-4.5-preview", name: "OpenAI GPT-4.5 Preview" },
   { id: "deepseek-chat", name: "DeepSeek Chat (V3 / R1)" },
+];
+
+const CLAUDE_CODE_MODELS = [
+  { id: "claude-3-7-sonnet", name: "Anthropic Claude 3.7 Sonnet (Recommended)" },
+  { id: "claude-3-5-sonnet", name: "Anthropic Claude 3.5 Sonnet" },
 ];
 
 function isModelAllowed(
@@ -99,6 +109,7 @@ export function TaskCreateModal({
   const [baseBranch, setBaseBranch] = React.useState(
     projects[0]?.defaultBaseBranch || "main"
   );
+  const [harnessType, setHarnessType] = React.useState<HarnessType>("OpenCode");
   const [model, setModel] = React.useState(SUPPORTED_MODELS[0].id);
   const [credentialsList, setCredentialsList] = React.useState<ProviderCredentialReference[]>(
     credentials
@@ -110,6 +121,17 @@ export function TaskCreateModal({
   const [maxBudgetUsd, setMaxBudgetUsd] = React.useState<string>("5.00");
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+
+  const handleHarnessChange = (newHarness: HarnessType) => {
+    setHarnessType(newHarness);
+    if (newHarness === "ClaudeCode") {
+      if (model !== "claude-3-7-sonnet" && model !== "claude-3-5-sonnet") {
+        setModel("claude-3-7-sonnet");
+      }
+    }
+  };
+
+  const availableModels = harnessType === "ClaudeCode" ? CLAUDE_CODE_MODELS : SUPPORTED_MODELS;
 
   // Sync projects
   React.useEffect(() => {
@@ -186,7 +208,7 @@ export function TaskCreateModal({
       setIsSubmitting(true);
       setError(null);
 
-      const payload: CreateTaskPayload = {
+      const payload: CreateTaskRequest = {
         projectId,
         userId,
         title: title.trim(),
@@ -194,11 +216,12 @@ export function TaskCreateModal({
         providerCredentialReferenceId: credentialId,
         model,
         instruction: instruction.trim(),
-        harnessVersion: "opencode-v1",
+        harnessVersion: harnessType === "ClaudeCode" ? "claude-code" : "opencode-v1",
+        harnessType,
         maxBudgetUsd: maxBudgetUsd ? parseFloat(maxBudgetUsd) : undefined,
       };
 
-      const result = await createTask(organizationId, payload);
+      const result = await createTask(organizationId, payload as unknown as CreateTaskPayload);
       onOpenChange(false);
       onTaskCreated(result.task.id);
     } catch (err: unknown) {
@@ -278,8 +301,22 @@ export function TaskCreateModal({
               </div>
             </div>
 
-            {/* Model & BYOK Key */}
+            {/* Harness & Model */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="task-harness" className="block text-xs font-semibold text-foreground mb-1.5">
+                  AI Coding Harness
+                </label>
+                <Select
+                  id="task-harness"
+                  value={harnessType}
+                  onChange={(e) => handleHarnessChange(e.target.value as HarnessType)}
+                >
+                  <option value="OpenCode">OpenCode (v1.18.32)</option>
+                  <option value="ClaudeCode">Claude Code</option>
+                </Select>
+              </div>
+
               <div>
                 <label htmlFor="task-model" className="block text-xs font-semibold text-foreground mb-1.5">
                   AI Model
@@ -289,40 +326,41 @@ export function TaskCreateModal({
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                 >
-                  {SUPPORTED_MODELS.map((m) => (
+                  {availableModels.map((m) => (
                     <option key={m.id} value={m.id}>
                       {m.name}
                     </option>
                   ))}
                 </Select>
               </div>
+            </div>
 
-              <div>
-                <label htmlFor="task-credential" className="block text-xs font-semibold text-foreground mb-1.5">
-                  Provider Key (BYOK)
-                </label>
-                {credentialsList.length === 0 ? (
-                  <div className="text-xs text-amber-600 bg-amber-500/10 p-2 rounded border border-amber-500/20">
-                    No keys registered. Go to Connections to add your write-only key.
-                  </div>
-                ) : (
-                  <Select
-                    id="task-credential"
-                    value={credentialId}
-                    onChange={(e) => setCredentialId(e.target.value)}
-                  >
-                    {credentialsList.map((c) => {
-                      const isOrg = c.scope === "Organization";
-                      const prefix = isOrg ? "[Org Shared]" : "[Personal]";
-                      return (
-                        <option key={c.id} value={c.id}>
-                          {prefix} {c.label} ({c.providerName})
-                        </option>
-                      );
-                    })}
-                  </Select>
-                )}
-              </div>
+            {/* Provider Key (BYOK) */}
+            <div>
+              <label htmlFor="task-credential" className="block text-xs font-semibold text-foreground mb-1.5">
+                Provider Key (BYOK)
+              </label>
+              {credentialsList.length === 0 ? (
+                <div className="text-xs text-amber-600 bg-amber-500/10 p-2 rounded border border-amber-500/20">
+                  No keys registered. Go to Connections to add your write-only key.
+                </div>
+              ) : (
+                <Select
+                  id="task-credential"
+                  value={credentialId}
+                  onChange={(e) => setCredentialId(e.target.value)}
+                >
+                  {credentialsList.map((c) => {
+                    const isOrg = c.scope === "Organization";
+                    const prefix = isOrg ? "[Org Shared]" : "[Personal]";
+                    return (
+                      <option key={c.id} value={c.id}>
+                        {prefix} {c.label} ({c.providerName})
+                      </option>
+                    );
+                  })}
+                </Select>
+              )}
             </div>
 
             {/* Selected Credential Policy info & Badges */}

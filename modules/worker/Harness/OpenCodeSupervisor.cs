@@ -13,6 +13,7 @@ public sealed class OpenCodeSupervisor : IOpenCodeSupervisor, IDisposable
     private readonly HttpClient _httpClient;
     private readonly OpenCodeHarnessAdapter _adapter;
 
+    public string HarnessType => "OpenCode";
     public string PinnedVersion => "1.18.32";
     public string LoopbackHost => _options.OpenCodeHost;
     public int Port => _options.OpenCodePort;

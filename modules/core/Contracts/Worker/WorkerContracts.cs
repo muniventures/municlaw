@@ -1,4 +1,5 @@
 using MuniClaw.Core.Contracts.Tasks;
+using MuniClaw.Core.Models;
 
 namespace MuniClaw.Core.Contracts.Worker;
 
@@ -17,6 +18,7 @@ public sealed record WorkerClaimResponse
     public string? RepositoryCloneUrl { get; init; }
     public string? TaskBranch { get; init; }
     public string? BaseCommit { get; init; }
+    public HarnessType HarnessType { get; init; } = HarnessType.OpenCode;
     public string? HarnessVersion { get; init; }
     public string? LeaseToken { get; init; }
     public long FencingToken { get; init; }

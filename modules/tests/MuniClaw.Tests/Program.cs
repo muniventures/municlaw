@@ -1886,6 +1886,83 @@ public static class Program
             Assert(accessDenied, "Unauthorized user must be denied permission to trigger preview deployment");
         });
 
+        // --- T90 Pluggable AI Coding Harness Adapters Qualification Tests ---
+
+        await RunAsyncTest("T90: Harness: Task creation with ClaudeCode harness type", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            // 1. Create task explicitly requesting ClaudeCode harness
+            var req = new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Claude Code Refactoring",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "claude-3-7-sonnet",
+                Instruction = "Refactor architecture with Claude Code",
+                HarnessType = HarnessType.ClaudeCode,
+                HarnessVersion = "claude-code"
+            };
+
+            var (task, run) = await lifecycle.CreateTaskAsync(req, default);
+
+            Assert(run.HarnessType == HarnessType.ClaudeCode, "TaskRun.HarnessType must be ClaudeCode");
+            Assert(run.HarnessVersion == "claude-code", "TaskRun.HarnessVersion must match");
+
+            // 2. Follow-up turn preserves HarnessType
+            run.Status = TaskRunStatus.Completed;
+            var followUpRun = await lifecycle.CreateFollowUpRunAsync(task.Id, userId, "Follow-up turn", default);
+
+            Assert(followUpRun.HarnessType == HarnessType.ClaudeCode, "Follow-up TaskRun must preserve parent run HarnessType");
+        });
+
+        await RunAsyncTest("T90: Harness: Worker claim populates requested HarnessType", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            // Create ClaudeCode task
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Claude Code Claim Task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "claude-3-7-sonnet",
+                Instruction = "Perform work",
+                HarnessType = HarnessType.ClaudeCode,
+                HarnessVersion = "claude-code"
+            }, default);
+
+            // Worker claims work
+            var claim = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "claude-code"
+            }, default);
+
+            Assert(claim.HasWork, "Worker should successfully claim work");
+            Assert(claim.RunId == run.Id, "Claimed run ID matches");
+            Assert(claim.HarnessType == HarnessType.ClaudeCode, "Claim response must contain HarnessType.ClaudeCode");
+            Assert(claim.HarnessVersion == "claude-code", "Claim response must contain requested harness version");
+        });
+
         Console.WriteLine("\n-------------------------------------------------");
         Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
         Console.WriteLine("-------------------------------------------------");

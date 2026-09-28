@@ -274,6 +274,14 @@ export function TaskDetailModule() {
               {task.taskBranch}
             </span>
             <span>Base: {task.baseBranch}</span>
+            <Badge
+              variant="outline"
+              className="text-[11px] font-mono px-1.5 py-0 border-border bg-muted/40 text-foreground font-medium"
+            >
+              {(activeRun?.harnessType ?? task.harnessType) === "ClaudeCode"
+                ? "[Claude Code]"
+                : "[OpenCode]"}
+            </Badge>
             {activeRun && (
               <span className="px-2 py-0.5 rounded bg-muted text-foreground">
                 Run #{activeRun.runIndex} ({activeRun.resolvedModel})

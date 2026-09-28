@@ -5,22 +5,6 @@ using TaskStatus = MuniClaw.Core.Contracts.Tasks.TaskStatus;
 
 namespace MuniClaw.Core.Services;
 
-public sealed record CreateTaskRequest
-{
-    public required Guid OrganizationId { get; init; }
-    public required Guid ProjectId { get; init; }
-    public required Guid UserId { get; init; }
-    public required string Title { get; init; }
-    public required string BaseBranch { get; init; }
-    public string? BaseCommitSha { get; init; }
-    public required Guid ProviderCredentialReferenceId { get; init; }
-    public required string Model { get; init; }
-    public required string Instruction { get; init; }
-    public required string HarnessVersion { get; init; }
-    public decimal? MaxBudgetUsd { get; init; }
-    public string? IdempotencyKey { get; init; }
-    public bool StrictConcurrencyLimit { get; init; } = false;
-}
 
 public interface ITaskLifecycleService
 {
@@ -169,6 +153,7 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
                 ProviderCredentialReferenceId = request.ProviderCredentialReferenceId,
                 ResolvedModel = request.Model,
                 Instruction = request.Instruction,
+                HarnessType = request.HarnessType,
                 HarnessVersion = request.HarnessVersion,
                 MaxBudgetUsd = request.MaxBudgetUsd,
                 CreatedAt = now,
@@ -243,6 +228,7 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
                 ProviderCredentialReferenceId = latestRun.ProviderCredentialReferenceId,
                 ResolvedModel = latestRun.ResolvedModel,
                 Instruction = instruction,
+                HarnessType = latestRun.HarnessType,
                 HarnessVersion = latestRun.HarnessVersion,
                 MaxBudgetUsd = latestRun.MaxBudgetUsd,
                 CreatedAt = DateTimeOffset.UtcNow

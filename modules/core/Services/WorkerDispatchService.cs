@@ -103,6 +103,7 @@ public sealed class WorkerDispatchService : IWorkerDispatchService
                 RepositoryCloneUrl = $"https://git.mock/{repoConn.RepositoryFullName}.git",
                 TaskBranch = task.TaskBranch,
                 BaseCommit = task.BaseCommitSha,
+                HarnessType = nextRun.HarnessType,
                 HarnessVersion = nextRun.HarnessVersion,
                 LeaseToken = leaseToken,
                 FencingToken = fencingToken,

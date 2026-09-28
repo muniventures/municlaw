@@ -125,6 +125,23 @@ export interface ProviderCredentialReference {
   policy?: OrganizationCredentialPolicy;
 }
 
+export type HarnessType = "OpenCode" | "ClaudeCode";
+
+export interface CreateTaskRequest {
+  projectId: string;
+  userId: string;
+  title: string;
+  baseBranch: string;
+  baseCommitSha?: string;
+  providerCredentialReferenceId: string;
+  model: string;
+  instruction: string;
+  harnessVersion: string;
+  harnessType?: HarnessType;
+  maxBudgetUsd?: number;
+  idempotencyKey?: string;
+}
+
 export interface TaskEntity {
   id: string;
   organizationId: string;
@@ -140,10 +157,12 @@ export interface TaskEntity {
   project?: Project;
   runs: TaskRun[];
   queuePosition?: number;
+  harnessType?: HarnessType;
 }
 
 export interface TaskItem extends TaskEntity {
   queuePosition?: number;
+  harnessType?: HarnessType;
 }
 
 export interface TaskRun {
@@ -156,6 +175,7 @@ export interface TaskRun {
   providerCredentialReferenceId: string;
   resolvedModel: string;
   instruction: string;
+  harnessType?: HarnessType;
   harnessVersion: string;
   maxBudgetUsd?: number;
   createdAt: string;
