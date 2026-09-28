@@ -16,10 +16,16 @@ public sealed class Organization
     public required Guid Id { get; set; }
     public required string Name { get; set; }
     public required string Slug { get; set; }
+    public int MaxConcurrentRuns { get; set; } = 1;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     public ICollection<OrganizationMembership> Memberships { get; set; } = new List<OrganizationMembership>();
     public ICollection<Project> Projects { get; set; } = new List<Project>();
+}
+
+public sealed partial class TaskRun
+{
+    public int? QueuePosition { get; set; }
 }
 
 public enum MembershipRole

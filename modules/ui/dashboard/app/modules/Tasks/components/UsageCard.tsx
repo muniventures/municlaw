@@ -1,12 +1,19 @@
-import { Coins, HardDrive, Info } from "lucide-react";
+import { Coins, HardDrive, Info, Layers } from "lucide-react";
 import type { UsageRecordEntity } from "@/api/types";
 
 interface UsageCardProps {
   usage?: UsageRecordEntity | null;
   retentionDays?: number;
+  activeRuns?: number;
+  maxConcurrentRuns?: number;
 }
 
-export function UsageCard({ usage, retentionDays = 7 }: UsageCardProps) {
+export function UsageCard({
+  usage,
+  retentionDays = 7,
+  activeRuns = 0,
+  maxConcurrentRuns = 2,
+}: UsageCardProps) {
   const hasUsage = usage && (usage.promptTokens > 0 || usage.completionTokens > 0);
 
   return (
@@ -65,6 +72,29 @@ export function UsageCard({ usage, retentionDays = 7 }: UsageCardProps) {
           <span>Usage is unknown until reported by the active OpenCode worker.</span>
         </div>
       )}
+
+      {/* Concurrency Slot Usage */}
+      <div className="p-3 rounded-lg bg-muted/40 border border-border/60 space-y-2">
+        <div className="flex items-center justify-between text-xs">
+          <div className="flex items-center gap-1.5 font-medium text-foreground">
+            <Layers className="h-3.5 w-3.5 text-primary" />
+            <span>Active Concurrency: {activeRuns} / {maxConcurrentRuns} slots in use</span>
+          </div>
+          <span className="text-[11px] font-mono text-muted-foreground">
+            {Math.min(100, Math.round((activeRuns / (maxConcurrentRuns || 1)) * 100))}%
+          </span>
+        </div>
+        <div className="w-full bg-muted rounded-full h-2 overflow-hidden border border-border/40">
+          <div
+            className={`h-full transition-all duration-300 rounded-full ${
+              activeRuns >= maxConcurrentRuns ? "bg-amber-500" : "bg-primary"
+            }`}
+            style={{
+              width: `${Math.min(100, Math.max(0, Math.round((activeRuns / (maxConcurrentRuns || 1)) * 100)))}%`,
+            }}
+          />
+        </div>
+      </div>
 
       {/* Retention Limits */}
       <div className="pt-2 border-t border-border/60 flex items-center justify-between text-[11px] text-muted-foreground">

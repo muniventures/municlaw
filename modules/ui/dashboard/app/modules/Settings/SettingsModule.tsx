@@ -7,6 +7,7 @@ import {
   Lock,
   Info,
   Bell,
+  Layers,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -90,6 +91,9 @@ export function SettingsModule() {
   const [isLoading, setIsLoading] = React.useState(true);
   const [isSaving, setIsSaving] = React.useState(false);
   const [saveSuccess, setSaveSuccess] = React.useState(false);
+  const [maxConcurrentRuns, setMaxConcurrentRuns] = React.useState<number>(2);
+  const [isSavingQuota, setIsSavingQuota] = React.useState(false);
+  const [quotaSaveSuccess, setQuotaSaveSuccess] = React.useState(false);
 
   React.useEffect(() => {
     async function load() {
@@ -101,12 +105,54 @@ export function SettingsModule() {
         ]);
         setOrg(orgData);
         setPolicies(policyData);
+
+        let savedQuota = 2;
+        if (typeof localStorage !== "undefined") {
+          const raw = localStorage.getItem(`municlaw_concurrency_${config.defaultOrganizationId}`);
+          if (raw) {
+            const parsed = parseInt(raw, 10);
+            if (!isNaN(parsed) && parsed >= 1 && parsed <= 10) {
+              savedQuota = parsed;
+            }
+          }
+        }
+        setMaxConcurrentRuns(orgData.maxConcurrentRuns ?? savedQuota);
       } finally {
         setIsLoading(false);
       }
     }
     load();
   }, [config.defaultOrganizationId]);
+
+  const handleQuotaChange = (val: number) => {
+    const clamped = Math.max(1, Math.min(10, val));
+    setMaxConcurrentRuns(clamped);
+    setQuotaSaveSuccess(false);
+  };
+
+  const handleSaveQuota = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      setIsSavingQuota(true);
+      const clamped = Math.max(1, Math.min(10, maxConcurrentRuns));
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(
+          `municlaw_concurrency_${config.defaultOrganizationId}`,
+          String(clamped)
+        );
+      }
+      if (org) {
+        setOrg({
+          ...org,
+          maxConcurrentRuns: clamped,
+        });
+      }
+      setQuotaSaveSuccess(true);
+      setTimeout(() => setQuotaSaveSuccess(false), 3000);
+    } finally {
+      setIsSavingQuota(false);
+    }
+  };
 
   const handlePolicyChange = (category: CapabilityCategory, value: ApprovalPolicySetting) => {
     if (category === "PlatformDenied") return; // Invariant
@@ -268,51 +314,137 @@ export function SettingsModule() {
         </TabsContent>
 
         {/* General Tab */}
-        <TabsContent value="general">
+        <TabsContent value="general" className="space-y-6">
           {isLoading || !org ? (
             <div className="p-8 text-center text-muted-foreground font-mono text-xs rounded-xl border border-border bg-card">
               Loading organization details...
             </div>
           ) : (
-            <div className="rounded-xl border border-border bg-card p-6 shadow-xs space-y-4">
-              <div className="flex items-center gap-2 font-semibold text-foreground text-sm border-b border-border pb-3">
-                <Building className="h-4 w-4 text-muted-foreground" />
-                <span>Organization Details</span>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label htmlFor="settings-org-name" className="block text-xs font-semibold text-foreground mb-1">
-                    Organization Name
-                  </label>
-                  <Input
-                    id="settings-org-name"
-                    value={org?.name || ""}
-                    disabled
-                    className="bg-muted/40"
-                  />
+            <>
+              <div className="rounded-xl border border-border bg-card p-6 shadow-xs space-y-4">
+                <div className="flex items-center gap-2 font-semibold text-foreground text-sm border-b border-border pb-3">
+                  <Building className="h-4 w-4 text-muted-foreground" />
+                  <span>Organization Details</span>
                 </div>
 
-                <div>
-                  <label htmlFor="settings-org-slug" className="block text-xs font-semibold text-foreground mb-1">
-                    Organization Slug
-                  </label>
-                  <Input
-                    id="settings-org-slug"
-                    value={org?.slug || ""}
-                    disabled
-                    className="bg-muted/40 font-mono text-xs"
-                  />
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label htmlFor="settings-org-name" className="block text-xs font-semibold text-foreground mb-1">
+                      Organization Name
+                    </label>
+                    <Input
+                      id="settings-org-name"
+                      value={org?.name || ""}
+                      disabled
+                      className="bg-muted/40"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="settings-org-slug" className="block text-xs font-semibold text-foreground mb-1">
+                      Organization Slug
+                    </label>
+                    <Input
+                      id="settings-org-slug"
+                      value={org?.slug || ""}
+                      disabled
+                      className="bg-muted/40 font-mono text-xs"
+                    />
+                  </div>
+                </div>
+
+                <div className="pt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                  <Badge variant="success" className="gap-1 text-[11px]">
+                    <CheckCircle2 className="h-3 w-3" /> Private Allowlisted
+                  </Badge>
+                  <span>Shared sign-in verified. Dedicated Minicloud VPS attached.</span>
                 </div>
               </div>
 
-              <div className="pt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                <Badge variant="success" className="gap-1 text-[11px]">
-                  <CheckCircle2 className="h-3 w-3" /> Private Allowlisted
-                </Badge>
-                <span>Shared sign-in verified. Dedicated Minicloud VPS attached.</span>
+              {/* Concurrency Quota Settings */}
+              <div className="rounded-xl border border-border bg-card p-6 shadow-xs space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-border pb-3">
+                  <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
+                    <Layers className="h-4 w-4 text-primary" />
+                    <span>Parallel Execution & Concurrency Quota</span>
+                  </div>
+                  <Badge variant="outline" className="text-xs font-mono">
+                    Max: 10 parallel runs
+                  </Badge>
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Configure the maximum number of concurrent task runs (<code>MaxConcurrentRuns</code>) allowed to execute simultaneously
+                  (in Preparing, Running, or Awaiting Approval states) across your organization.
+                  Additional tasks will automatically queue in FIFO order.
+                </p>
+
+                <form onSubmit={handleSaveQuota} className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+                    <div>
+                      <label
+                        htmlFor="concurrency-quota-select"
+                        className="block text-xs font-semibold text-foreground mb-1"
+                      >
+                        Concurrency Quota (MaxConcurrentRuns: 1 to 10)
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <select
+                          id="concurrency-quota-select"
+                          value={maxConcurrentRuns}
+                          onChange={(e) => handleQuotaChange(parseInt(e.target.value, 10))}
+                          className="h-9 flex-1 rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          aria-label="Max Concurrent Runs selector"
+                        >
+                          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num) => (
+                            <option key={num} value={num}>
+                              {num} {num === 1 ? "concurrent run" : "concurrent runs"} {num === 2 ? "(Default)" : ""}
+                            </option>
+                          ))}
+                        </select>
+                        <Input
+                          id="concurrency-quota-input"
+                          type="number"
+                          min={1}
+                          max={10}
+                          value={maxConcurrentRuns}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value, 10);
+                            if (!isNaN(val)) handleQuotaChange(val);
+                          }}
+                          className="w-20 text-center font-mono"
+                          aria-label="Direct input for concurrency quota"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                      <Button
+                        type="submit"
+                        disabled={isSavingQuota}
+                        size="sm"
+                        className="gap-1.5"
+                      >
+                        <Save className="h-3.5 w-3.5" />
+                        <span>{isSavingQuota ? "Saving..." : "Save Quota"}</span>
+                      </Button>
+                      {quotaSaveSuccess && (
+                        <span className="text-xs font-semibold text-emerald-600 flex items-center gap-1">
+                          <CheckCircle2 className="h-3.5 w-3.5" /> Quota updated
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-muted/40 border border-border text-xs text-muted-foreground flex items-center gap-2">
+                    <Info className="h-4 w-4 shrink-0 text-primary" />
+                    <span>
+                      Organization administrators can adjust <strong>MaxConcurrentRuns</strong> from 1 to 10 slots. Tasks submitted when all slots are full will automatically be placed into the queue.
+                    </span>
+                  </div>
+                </form>
               </div>
-            </div>
+            </>
           )}
         </TabsContent>
 

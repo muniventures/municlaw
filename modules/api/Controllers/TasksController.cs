@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using MuniClaw.Core.Contracts.Tasks;
+using MuniClaw.Core.Data;
+using MuniClaw.Core.Models;
 using MuniClaw.Core.Services;
 
 namespace MuniClaw.Api.Controllers;
@@ -11,11 +13,19 @@ public sealed class TasksController : ControllerBase
 {
     private readonly ITaskLifecycleService _lifecycle;
     private readonly IWorkerDispatchService _dispatch;
+    private readonly ITaskQueueService _queueService;
+    private readonly IMuniClawStore _store;
 
-    public TasksController(ITaskLifecycleService lifecycle, IWorkerDispatchService dispatch)
+    public TasksController(
+        ITaskLifecycleService lifecycle,
+        IWorkerDispatchService dispatch,
+        ITaskQueueService queueService,
+        IMuniClawStore store)
     {
         _lifecycle = lifecycle;
         _dispatch = dispatch;
+        _queueService = queueService;
+        _store = store;
     }
 
     [HttpGet]
@@ -34,6 +44,54 @@ public sealed class TasksController : ControllerBase
             return NotFound(new { error = "task_not_found", message = $"Task {taskId} was not found." });
         }
         return Ok(task);
+    }
+
+    [HttpGet("/api/v1/tasks/{taskId:guid}/queue")]
+    [HttpGet("{taskId:guid}/queue")]
+    public async Task<IActionResult> GetTaskQueue(
+        [FromRoute] Guid taskId,
+        [FromRoute] Guid? organizationId,
+        CancellationToken ct)
+    {
+        TaskEntity? task = null;
+        if (organizationId.HasValue)
+        {
+            task = await _lifecycle.GetTaskAsync(taskId, organizationId.Value, ct);
+        }
+        else if (_store.Tasks.TryGetValue(taskId, out var foundTask))
+        {
+            task = foundTask;
+        }
+
+        if (task == null)
+        {
+            return NotFound(new { error = "task_not_found", message = $"Task {taskId} was not found." });
+        }
+
+        var orgId = task.OrganizationId;
+        var maxConcurrentRuns = _store.Organizations.TryGetValue(orgId, out var org)
+            ? org.MaxConcurrentRuns
+            : 2;
+
+        var activeRuns = await _queueService.GetActiveRunsCountAsync(orgId, ct);
+
+        var latestRun = _store.TaskRuns.Values
+            .Where(r => r.TaskId == taskId)
+            .OrderByDescending(r => r.RunIndex)
+            .FirstOrDefault();
+
+        int? queuePosition = null;
+        if (latestRun != null && latestRun.Status == TaskRunStatus.Queued)
+        {
+            queuePosition = await _queueService.GetQueuePositionAsync(orgId, latestRun.Id, ct);
+        }
+
+        return Ok(new
+        {
+            queuePosition,
+            activeRuns,
+            maxConcurrentRuns
+        });
     }
 
     public sealed record CreateTaskPayload

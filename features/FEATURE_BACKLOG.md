@@ -4,5 +4,6 @@
 - Organization-shared provider credentials and administrator-managed access policy: [complete and qualified](product/organization-credentials/0.execution-plan.md).
 - Self-host distribution (standalone persistence, encrypted secrets, containerization, and operations guide): [complete and qualified](platform/self-host/0.execution-plan.md).
 - Outbound messaging adapters & webhooks (Slack Block Kit, Discord Embeds, signed generic HTTP webhooks): [complete and qualified](integrations/messaging-adapters/0.execution-plan.md).
-- Later: native mobile, preview deployments, additional harnesses, parallel runs, and public billing.
+- Parallel task execution and concurrency scheduling (organization quota, FIFO queueing, automated promotion): [complete and qualified](product/parallel-runs/0.execution-plan.md).
+- Later: native mobile, preview deployments, additional harnesses, and public billing.
 - Select a distribution license before an open-source release.

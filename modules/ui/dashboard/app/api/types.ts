@@ -59,6 +59,7 @@ export interface Organization {
   name: string;
   slug: string;
   createdAt: string;
+  maxConcurrentRuns?: number;
 }
 
 export interface RepositoryConnection {
@@ -138,6 +139,11 @@ export interface TaskEntity {
   archivedAt?: string;
   project?: Project;
   runs: TaskRun[];
+  queuePosition?: number;
+}
+
+export interface TaskItem extends TaskEntity {
+  queuePosition?: number;
 }
 
 export interface TaskRun {
@@ -146,6 +152,7 @@ export interface TaskRun {
   organizationId: string;
   runIndex: number;
   status: TaskRunStatus;
+  queuePosition?: number;
   providerCredentialReferenceId: string;
   resolvedModel: string;
   instruction: string;
@@ -157,6 +164,12 @@ export interface TaskRun {
   failureReason?: string;
   events?: TaskEventDto[];
   approvals?: ApprovalRequestRecord[];
+}
+
+export interface TaskQueueStatus {
+  queuePosition?: number | null;
+  activeRuns: number;
+  maxConcurrentRuns: number;
 }
 
 export interface TaskEventDto {

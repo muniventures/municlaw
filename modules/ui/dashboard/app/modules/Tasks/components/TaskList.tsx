@@ -11,13 +11,13 @@ import {
   Plus,
   Search,
 } from "lucide-react";
-import type { TaskEntity, TaskRunStatus } from "@/api/types";
+import type { TaskEntity, TaskItem, TaskRunStatus } from "@/api/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
 interface TaskListProps {
-  tasks: TaskEntity[];
+  tasks: (TaskEntity | TaskItem)[];
   isLoading: boolean;
   onOpenCreateModal: () => void;
 }
@@ -39,10 +39,27 @@ export function TaskList({
     if (statusFilter === "all") return true;
 
     const latestRun = t.runs?.[t.runs.length - 1];
-    return latestRun?.status.toLowerCase() === statusFilter.toLowerCase();
+    const runStatus = latestRun?.status ?? (t.queuePosition ? "Queued" : "Queued");
+    return runStatus.toLowerCase() === statusFilter.toLowerCase();
   });
 
-  const getStatusBadge = (status?: TaskRunStatus) => {
+  const getStatusBadge = (status?: TaskRunStatus | string, queuePosition?: number | null) => {
+    const s = status?.toLowerCase();
+    if (s === "queued") {
+      const label = queuePosition != null && queuePosition > 0
+        ? `Queued #${queuePosition}`
+        : "Queued";
+      return (
+        <Badge
+          variant="secondary"
+          className="gap-1 bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30 font-medium"
+        >
+          <Clock className="h-3 w-3" />
+          {label}
+        </Badge>
+      );
+    }
+
     switch (status) {
       case "Running":
       case "Preparing":
@@ -81,13 +98,20 @@ export function TaskList({
             {status}
           </Badge>
         );
-      default:
+      default: {
+        const label = queuePosition != null && queuePosition > 0
+          ? `Queued #${queuePosition}`
+          : "Queued";
         return (
-          <Badge variant="outline" className="gap-1">
+          <Badge
+            variant="secondary"
+            className="gap-1 bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30 font-medium"
+          >
             <Clock className="h-3 w-3" />
-            Queued
+            {label}
           </Badge>
         );
+      }
     }
   };
 
@@ -152,6 +176,8 @@ export function TaskList({
         <div className="grid gap-3">
           {filteredTasks.map((task) => {
             const latestRun = task.runs?.[task.runs.length - 1];
+            const queuePos = latestRun?.queuePosition ?? task.queuePosition;
+            const runStatus = latestRun?.status ?? (queuePos ? "Queued" : undefined);
             return (
               <Link
                 key={task.id}
@@ -164,7 +190,7 @@ export function TaskList({
                       <span className="font-semibold text-sm group-hover:text-primary transition-colors truncate">
                         {task.title}
                       </span>
-                      {getStatusBadge(latestRun?.status)}
+                      {getStatusBadge(runStatus, queuePos)}
                     </div>
                     <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap font-mono">
                       <span className="flex items-center gap-1.5">

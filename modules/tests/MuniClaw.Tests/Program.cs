@@ -1360,6 +1360,339 @@ public static class Program
             Assert(remaining.Count == 1, "Only 1 channel remains after deletion");
         });
 
+        // --- T90 Parallel Task Execution & Concurrency Scheduling Qualification Tests ---
+
+        await RunAsyncTest("T90: Concurrency: Parallel task execution within organization quota", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            store.Organizations[orgId].MaxConcurrentRuns = 2;
+
+            // 1. Create first task -> starts in Queued (ready for worker claim)
+            var (task1, run1) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Parallel Task 1",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task 1",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(run1.Status == TaskRunStatus.Queued, "First task should start in Queued");
+            Assert(run1.QueuePosition == null, "Task within capacity has no queue wait position");
+
+            // Worker 1 claims run 1 -> transitions to Preparing
+            var claim1 = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(claim1.HasWork && claim1.RunId == run1.Id, "Worker 1 claimed task 1");
+            Assert(run1.Status == TaskRunStatus.Preparing, "First task transitions to Preparing");
+
+            // 2. Create second task -> starts in Queued within quota
+            var (task2, run2) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Parallel Task 2",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task 2",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(run2.Status == TaskRunStatus.Queued, "Second task starts in Queued within quota");
+            Assert(run2.QueuePosition == null, "Second task within capacity has no queue wait position");
+
+            // Worker 2 claims run 2 -> transitions to Preparing concurrently (slot 2 of 2)
+            var claim2 = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(claim2.HasWork && claim2.RunId == run2.Id, "Worker 2 claimed task 2 concurrently");
+            Assert(run2.Status == TaskRunStatus.Preparing, "Second task transitions to Preparing");
+
+            // Both tasks are actively executing concurrently
+            var activeCount = await queueService.GetActiveRunsCountAsync(orgId, default);
+            Assert(activeCount == 2, $"Expected 2 active runs, got {activeCount}");
+
+            // A third worker claim fails because organization quota (2) is saturated
+            var claim3 = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(!claim3.HasWork, "Worker claim must return HasWork=false when concurrency quota is saturated");
+        });
+
+        await RunAsyncTest("T90: Concurrency: FIFO queueing and queue position assignment when quota is saturated", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            store.Organizations[orgId].MaxConcurrentRuns = 2;
+
+            // Saturate quota with 2 active tasks
+            var (taskA, runA) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Active Task A",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task A",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var (taskB, runB) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Active Task B",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task B",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var claimA = await dispatch.ClaimWorkAsync(new WorkerClaimRequest { WorkerId = Guid.NewGuid(), OrganizationId = orgId, SupportedHarnessVersion = "1.18.32" }, default);
+            var claimB = await dispatch.ClaimWorkAsync(new WorkerClaimRequest { WorkerId = Guid.NewGuid(), OrganizationId = orgId, SupportedHarnessVersion = "1.18.32" }, default);
+            Assert(claimA.HasWork && claimB.HasWork, "Both active tasks claimed into Preparing");
+
+            // 3. Create third task -> quota saturated, enters Queued at position #1
+            var (task3, run3) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Queued Task C",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task C",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(run3.Status == TaskRunStatus.Queued, "Task 3 must enter Queued state");
+            var pos3 = await queueService.GetQueuePositionAsync(orgId, run3.Id, default);
+            Assert(pos3 == 1, $"Task 3 queue position should be 1, got {pos3}");
+
+            // 4. Create fourth task -> enters Queued at position #2
+            var (task4, run4) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Queued Task D",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task D",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(run4.Status == TaskRunStatus.Queued, "Task 4 must enter Queued state");
+            var pos4 = await queueService.GetQueuePositionAsync(orgId, run4.Id, default);
+            Assert(pos4 == 2, $"Task 4 queue position should be 2, got {pos4}");
+
+            var queuedList = await queueService.GetQueuedRunsAsync(orgId, default);
+            Assert(queuedList.Count == 2, $"Expected 2 queued runs, got {queuedList.Count}");
+            Assert(queuedList[0].Id == run3.Id, "FIFO order: Task 3 is first in queue");
+            Assert(queuedList[1].Id == run4.Id, "FIFO order: Task 4 is second in queue");
+        });
+
+        await RunAsyncTest("T90: Concurrency: Automatic promotion of queued tasks upon completion and cancellation", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            store.Organizations[orgId].MaxConcurrentRuns = 1; // Strict 1-slot concurrency for clear FIFO testing
+
+            // 1. Task 1 claims the single slot -> Preparing
+            var (task1, run1) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Slot 1 Task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task 1",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var claim1 = await dispatch.ClaimWorkAsync(new WorkerClaimRequest { WorkerId = Guid.NewGuid(), OrganizationId = orgId, SupportedHarnessVersion = "1.18.32" }, default);
+            Assert(claim1.HasWork && run1.Status == TaskRunStatus.Preparing, "Task 1 claimed into slot");
+
+            // 2. Task 2 queues at position #1
+            var (task2, run2) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Waiting Task 2",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task 2",
+                HarnessVersion = "1.18.32"
+            }, default);
+            Assert(run2.Status == TaskRunStatus.Queued, "Task 2 queued");
+            var pos2 = await queueService.GetQueuePositionAsync(orgId, run2.Id, default);
+            Assert(pos2 == 1, "Task 2 queue position is 1");
+
+            // 3. Task 3 queues at position #2
+            var (task3, run3) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Waiting Task 3",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Task 3",
+                HarnessVersion = "1.18.32"
+            }, default);
+            Assert(run3.Status == TaskRunStatus.Queued, "Task 3 queued");
+            var pos3Init = await queueService.GetQueuePositionAsync(orgId, run3.Id, default);
+            Assert(pos3Init == 2, "Task 3 queue position is 2");
+
+            // 4. Cancel Task 1 -> transitions to Cancelling, then supervisor reconciles terminal state to Cancelled
+            await lifecycle.CancelTaskAsync(task1.Id, userId, "Test cancellation", default);
+            Assert(run1.Status == TaskRunStatus.Cancelling, "Task 1 transitions to Cancelling");
+            await lifecycle.ReconcileTerminalRunAsync(run1.Id, TaskRunStatus.Cancelled, "Cancelled by user", default);
+            Assert(run1.Status == TaskRunStatus.Cancelled, "Task 1 is cancelled");
+
+            // Verify Task 2 was automatically promoted to Preparing
+            Assert(run2.Status == TaskRunStatus.Preparing, "Task 2 must be automatically promoted to Preparing on slot release");
+            Assert(run2.QueuePosition == null, "Promoted task no longer in queue");
+
+            // Verify Task 3 moved up to position #1
+            var pos3 = await queueService.GetQueuePositionAsync(orgId, run3.Id, default);
+            Assert(pos3 == 1, $"Task 3 should advance to position 1, got {pos3}");
+
+            // 5. Complete Task 2 -> triggers automatic promotion of Task 3 into Preparing!
+            run2.Status = TaskRunStatus.Completed;
+            var promoted3 = await queueService.PromoteNextQueuedTaskAsync(orgId, default);
+            Assert(promoted3 != null && promoted3.Id == run3.Id, "Task 3 promoted on Task 2 completion");
+            Assert(run3.Status == TaskRunStatus.Preparing, "Task 3 is now in Preparing");
+
+            var remainingQueued = await queueService.GetQueuedRunsAsync(orgId, default);
+            Assert(remainingQueued.Count == 0, "Queue is now empty");
+        });
+
+        await RunAsyncTest("T90: Concurrency: Cross-organization quota isolation", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var dispatch = new WorkerDispatchService(store);
+
+            // Setup Org A (quota 1, saturated)
+            var (orgA, userA, projA, credA) = await SetupOrgProjectAndCredential(store, auth);
+            store.Organizations[orgA].MaxConcurrentRuns = 1;
+            var (taskA, runA) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgA,
+                ProjectId = projA,
+                UserId = userA,
+                Title = "Org A Task 1",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credA,
+                Model = "gpt-4o",
+                Instruction = "Task 1",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var claimA = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgA,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(claimA.HasWork && runA.Status == TaskRunStatus.Preparing, "Org A task claimed into slot");
+
+            // Setup Org B
+            var userB = await auth.GetOrCreateUserAsync("firebase:uid-b", "b@muni.dev", default);
+            await auth.SetUserAllowlistedAsync(userB.Id, true, default);
+            var orgB = Guid.NewGuid();
+            store.Organizations[orgB] = new Organization { Id = orgB, Name = "Org B", Slug = "org-b", MaxConcurrentRuns = 1 };
+            await auth.AddMemberToOrganizationAsync(orgB, userB.Id, MembershipRole.Admin, default);
+            var repoB = Guid.NewGuid();
+            store.RepositoryConnections[repoB] = new RepositoryConnection
+            {
+                Id = repoB, OrganizationId = orgB, GitHost = GitHostType.GitHub, ExternalAccountId = "acc-b",
+                RepositoryId = "repo-b", RepositoryFullName = "orgb/repo-b", DefaultBranch = "main", SecretReferencePath = "secret/b"
+            };
+            var projB = Guid.NewGuid();
+            store.Projects[projB] = new Project { Id = projB, OrganizationId = orgB, RepositoryConnectionId = repoB, Name = "Proj B", DefaultBaseBranch = "main" };
+            var credB = Guid.NewGuid();
+            store.ProviderCredentials[credB] = new ProviderCredentialReference
+            {
+                Id = credB, OrganizationId = orgB, OwningUserId = userB.Id, ProviderName = "openai", Label = "Key B",
+                Scope = CredentialScope.Personal, SecretReferencePath = "sec/b", IsRevoked = false
+            };
+
+            // Org B creates task -> Free slot, no queue wait position
+            var (taskB, runB) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgB,
+                ProjectId = projB,
+                UserId = userB.Id,
+                Title = "Org B Task 1",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credB,
+                Model = "gpt-4o",
+                Instruction = "Task B",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(runB.Status == TaskRunStatus.Queued, "Org B task starts in Queued");
+            Assert(runB.QueuePosition == null, "Org B task has free slot, no queue wait position");
+
+            // Org B worker claims task -> succeeds immediately despite Org A being saturated!
+            var claimB = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgB,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(claimB.HasWork && claimB.RunId == runB.Id, "Org B worker claims work independently of Org A");
+            Assert(runB.Status == TaskRunStatus.Preparing, "Org B task transitions to Preparing");
+        });
+
         Console.WriteLine("\n-------------------------------------------------");
         Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
         Console.WriteLine("-------------------------------------------------");

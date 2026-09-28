@@ -23,7 +23,7 @@ public sealed class TaskEntity
     public ICollection<TaskRun> Runs { get; set; } = new List<TaskRun>();
 }
 
-public sealed class TaskRun
+public sealed partial class TaskRun
 {
     public required Guid Id { get; set; }
     public required Guid TaskId { get; set; }

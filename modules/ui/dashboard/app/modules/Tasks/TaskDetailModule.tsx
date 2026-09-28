@@ -30,11 +30,13 @@ import {
   cancelRun,
   createFollowUp,
   getDelivery,
+  getTaskQueueStatus,
 } from "@/api/tasks";
 import { sseManager, type SseConnectionStatus } from "@/api/sse";
 import type {
   TaskEntity,
   TaskRun,
+  TaskQueueStatus,
   TaskEventDto,
   DiffFileChange,
   CheckResultPayload,
@@ -65,6 +67,7 @@ export function TaskDetailModule() {
   const [delivery, setDelivery] = React.useState<DeliveryRecord | null>(null);
   const [deliveryModalOpen, setDeliveryModalOpen] = React.useState(false);
   const [usage, setUsage] = React.useState<UsageRecordEntity | null>(null);
+  const [queueStatus, setQueueStatus] = React.useState<TaskQueueStatus | null>(null);
   const [isCancelling, setIsCancelling] = React.useState(false);
 
   // Load Task details
@@ -85,6 +88,14 @@ export function TaskDetailModule() {
       // Check delivery record
       const del = await getDelivery(config.defaultOrganizationId, taskId);
       setDelivery(del);
+
+      // Check queue status
+      try {
+        const qStatus = await getTaskQueueStatus(taskId);
+        setQueueStatus(qStatus);
+      } catch {
+        // Queue endpoint may not be available or returns 404
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Failed to load task details");
     } finally {
@@ -296,6 +307,31 @@ export function TaskDetailModule() {
         </div>
       </div>
 
+      {/* Queued Status Banner */}
+      {(activeRun?.status?.toLowerCase() === "queued" || (!activeRun && task.runs?.length === 0)) && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-amber-900 dark:text-amber-200 flex items-start sm:items-center justify-between gap-3 shadow-xs">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-amber-500/20 text-amber-600 dark:text-amber-400 shrink-0">
+              <Clock className="h-5 w-5 animate-pulse" />
+            </div>
+            <div>
+              <h3 className="font-semibold text-sm text-foreground">
+                Waiting in Queue — Position #{activeRun?.queuePosition ?? task.queuePosition ?? queueStatus?.queuePosition ?? 1}. Execution will automatically start when an active task slot becomes available.
+              </h3>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Your task is queued in fair FIFO order. As soon as an active execution finishes, this task will begin preparing automatically.
+              </p>
+            </div>
+          </div>
+          <Badge
+            variant="warning"
+            className="shrink-0 bg-amber-500/20 text-amber-700 dark:text-amber-400 border border-amber-500/30"
+          >
+            Position #{activeRun?.queuePosition ?? task.queuePosition ?? queueStatus?.queuePosition ?? 1}
+          </Badge>
+        </div>
+      )}
+
       {/* Pending Approvals Banner */}
       {pendingApprovals.map((approval) => (
         <ApprovalBanner
@@ -379,7 +415,12 @@ export function TaskDetailModule() {
         </TabsContent>
 
         <TabsContent value="usage">
-          <UsageCard usage={usage} retentionDays={7} />
+          <UsageCard
+            usage={usage}
+            retentionDays={7}
+            activeRuns={queueStatus?.activeRuns}
+            maxConcurrentRuns={queueStatus?.maxConcurrentRuns}
+          />
         </TabsContent>
       </Tabs>
 

@@ -1,5 +1,5 @@
 import { apiClient } from "./client";
-import type { DeliveryRecord, TaskEntity, TaskRun } from "./types";
+import type { DeliveryRecord, TaskEntity, TaskQueueStatus, TaskRun } from "./types";
 
 export interface CreateTaskPayload {
   projectId: string;
@@ -119,3 +119,10 @@ export async function getDelivery(
     throw err;
   }
 }
+
+export async function getTaskQueueStatus(
+  taskId: string
+): Promise<TaskQueueStatus> {
+  return apiClient<TaskQueueStatus>(`/api/v1/tasks/${taskId}/queue`);
+}
+

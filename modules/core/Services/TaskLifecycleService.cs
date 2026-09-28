@@ -19,6 +19,7 @@ public sealed record CreateTaskRequest
     public required string HarnessVersion { get; init; }
     public decimal? MaxBudgetUsd { get; init; }
     public string? IdempotencyKey { get; init; }
+    public bool StrictConcurrencyLimit { get; init; } = false;
 }
 
 public interface ITaskLifecycleService
@@ -26,22 +27,33 @@ public interface ITaskLifecycleService
     Task<(TaskEntity Task, TaskRun Run)> CreateTaskAsync(CreateTaskRequest request, CancellationToken ct);
     Task<TaskRun> CreateFollowUpRunAsync(Guid taskId, Guid userId, string instruction, CancellationToken ct);
     Task CancelRunAsync(Guid runId, Guid userId, string reason, CancellationToken ct);
+    Task CancelTaskAsync(Guid taskId, Guid userId, string reason, CancellationToken ct);
+    Task ReconcileTerminalRunAsync(Guid runId, TaskRunStatus terminalStatus, string? failureReason = null, CancellationToken ct = default);
+    Task ReconcileTerminatedRunsAsync(CancellationToken ct = default);
     Task<bool> HasActiveRunningTaskInOrganizationAsync(Guid organizationId, CancellationToken ct);
     Task<IReadOnlyList<TaskEntity>> ListTasksAsync(Guid organizationId, CancellationToken ct);
     Task<TaskEntity?> GetTaskAsync(Guid taskId, Guid organizationId, CancellationToken ct);
     Task<TaskRun?> GetRunAsync(Guid runId, Guid organizationId, CancellationToken ct);
+    ITaskQueueService QueueService { get; }
 }
 
 public sealed class TaskLifecycleService : ITaskLifecycleService
 {
     private readonly IMuniClawStore _store;
     private readonly IOrganizationAuthorizationService _auth;
+    private readonly ITaskQueueService _queueService;
     private readonly object _lock = new();
 
-    public TaskLifecycleService(IMuniClawStore store, IOrganizationAuthorizationService auth)
+    public ITaskQueueService QueueService => _queueService;
+
+    public TaskLifecycleService(
+        IMuniClawStore store,
+        IOrganizationAuthorizationService auth,
+        ITaskQueueService? queueService = null)
     {
         _store = store;
         _auth = auth;
+        _queueService = queueService ?? new TaskQueueService(store);
     }
 
     public async Task<(TaskEntity Task, TaskRun Run)> CreateTaskAsync(CreateTaskRequest request, CancellationToken ct)
@@ -104,6 +116,19 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
                 return (existingTask, latestRun);
             }
 
+            var maxConcurrent = _store.Organizations.TryGetValue(request.OrganizationId, out var org)
+                ? org.MaxConcurrentRuns
+                : 2;
+
+            var activeRunsCount = _store.TaskRuns.Values.Count(r =>
+                r.OrganizationId == request.OrganizationId &&
+                TaskQueueService.IsActiveExecuting(r.Status));
+
+            if (maxConcurrent == 1 && request.StrictConcurrencyLimit && activeRunsCount >= 1)
+            {
+                throw new InvalidOperationException("Organization concurrency limit of 1 run reached (strict concurrency rejection).");
+            }
+
             var taskId = Guid.NewGuid();
             var taskBranch = $"municlaw/task-{taskId:N}";
 
@@ -122,6 +147,17 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
             };
 
             var runId = Guid.NewGuid();
+            var now = DateTimeOffset.UtcNow;
+
+            int? queuePos = null;
+            if (activeRunsCount >= maxConcurrent)
+            {
+                var queuedCount = _store.TaskRuns.Values.Count(r =>
+                    r.OrganizationId == request.OrganizationId &&
+                    r.Status == TaskRunStatus.Queued);
+                queuePos = queuedCount + 1;
+            }
+
             var run = new TaskRun
             {
                 Id = runId,
@@ -129,12 +165,14 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
                 OrganizationId = request.OrganizationId,
                 RunIndex = 1,
                 Status = TaskRunStatus.Queued,
+                QueuePosition = queuePos,
                 ProviderCredentialReferenceId = request.ProviderCredentialReferenceId,
                 ResolvedModel = request.Model,
                 Instruction = request.Instruction,
                 HarnessVersion = request.HarnessVersion,
                 MaxBudgetUsd = request.MaxBudgetUsd,
-                CreatedAt = DateTimeOffset.UtcNow
+                CreatedAt = now,
+                StartedAt = null
             };
 
             _store.Tasks[task.Id] = task;
@@ -190,6 +228,10 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
             }
 
 
+            var queuedCount = _store.TaskRuns.Values.Count(r =>
+                r.OrganizationId == task.OrganizationId &&
+                r.Status == TaskRunStatus.Queued);
+
             var newRun = new TaskRun
             {
                 Id = Guid.NewGuid(),
@@ -197,11 +239,13 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
                 OrganizationId = task.OrganizationId,
                 RunIndex = latestRun.RunIndex + 1,
                 Status = TaskRunStatus.Queued,
+                QueuePosition = queuedCount + 1,
                 ProviderCredentialReferenceId = latestRun.ProviderCredentialReferenceId,
                 ResolvedModel = latestRun.ResolvedModel,
                 Instruction = instruction,
                 HarnessVersion = latestRun.HarnessVersion,
-                MaxBudgetUsd = latestRun.MaxBudgetUsd
+                MaxBudgetUsd = latestRun.MaxBudgetUsd,
+                CreatedAt = DateTimeOffset.UtcNow
             };
 
             _store.TaskRuns[newRun.Id] = newRun;
@@ -209,8 +253,37 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
         }
     }
 
+    public async Task CancelTaskAsync(Guid taskId, Guid userId, string reason, CancellationToken ct)
+    {
+        Guid? runId = null;
+        lock (_lock)
+        {
+            if (!_store.Tasks.TryGetValue(taskId, out var task))
+            {
+                throw new KeyNotFoundException($"Task {taskId} was not found.");
+            }
+
+            var latestRun = _store.TaskRuns.Values
+                .Where(r => r.TaskId == taskId)
+                .OrderByDescending(r => r.RunIndex)
+                .FirstOrDefault();
+
+            if (latestRun != null)
+            {
+                runId = latestRun.Id;
+            }
+        }
+
+        if (runId.HasValue)
+        {
+            await CancelRunAsync(runId.Value, userId, reason, ct);
+        }
+    }
+
     public async Task CancelRunAsync(Guid runId, Guid userId, string reason, CancellationToken ct)
     {
+        Guid orgId;
+        bool isTerminal;
         lock (_lock)
         {
             if (!_store.TaskRuns.TryGetValue(runId, out var run))
@@ -225,21 +298,78 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
 
             if (TaskRunStateTransitions.IsTerminal(run.Status))
             {
-                return; // Already terminal
+                orgId = run.OrganizationId;
+                isTerminal = true;
             }
-
-            TaskRunStateTransitions.ValidateTransition(run.Status, TaskRunStatus.Cancelling);
-            run.Status = TaskRunStatus.Cancelling;
-            run.FailureReason = $"Cancelled by user: {reason}";
-
-            // Immediate transition if queued, otherwise supervisor will acknowledge cancellation
-            if (run.Status == TaskRunStatus.Cancelling && run.LeaseToken == null)
+            else
             {
-                run.Status = TaskRunStatus.Cancelled;
-                run.CompletedAt = DateTimeOffset.UtcNow;
+                TaskRunStateTransitions.ValidateTransition(run.Status, TaskRunStatus.Cancelling);
+                run.Status = TaskRunStatus.Cancelling;
+                run.FailureReason = $"Cancelled by user: {reason}";
+
+                // Immediate transition if queued, otherwise supervisor will acknowledge cancellation
+                if (run.Status == TaskRunStatus.Cancelling && run.LeaseToken == null)
+                {
+                    run.Status = TaskRunStatus.Cancelled;
+                    run.CompletedAt = DateTimeOffset.UtcNow;
+                }
+
+                orgId = run.OrganizationId;
+                isTerminal = TaskRunStateTransitions.IsTerminal(run.Status);
             }
         }
-        await Task.CompletedTask;
+
+        if (isTerminal)
+        {
+            await _queueService.PromoteNextQueuedTaskAsync(orgId, ct);
+        }
+    }
+
+    public async Task ReconcileTerminalRunAsync(Guid runId, TaskRunStatus terminalStatus, string? failureReason = null, CancellationToken ct = default)
+    {
+        Guid orgId;
+        lock (_lock)
+        {
+            if (!_store.TaskRuns.TryGetValue(runId, out var run))
+            {
+                return;
+            }
+
+            if (!TaskRunStateTransitions.IsTerminal(terminalStatus))
+            {
+                throw new ArgumentException($"Status {terminalStatus} is not a terminal state.", nameof(terminalStatus));
+            }
+
+            if (TaskRunStateTransitions.IsTerminal(run.Status))
+            {
+                return;
+            }
+
+            TaskRunStateTransitions.ValidateTransition(run.Status, terminalStatus);
+            run.Status = terminalStatus;
+            run.CompletedAt = DateTimeOffset.UtcNow;
+            if (failureReason != null)
+            {
+                run.FailureReason = failureReason;
+            }
+            orgId = run.OrganizationId;
+        }
+
+        await _queueService.PromoteNextQueuedTaskAsync(orgId, ct);
+    }
+
+    public async Task ReconcileTerminatedRunsAsync(CancellationToken ct = default)
+    {
+        List<Guid> orgIdsToPromote;
+        lock (_lock)
+        {
+            orgIdsToPromote = _store.Organizations.Keys.ToList();
+        }
+
+        foreach (var orgId in orgIdsToPromote)
+        {
+            await _queueService.PromoteNextQueuedTaskAsync(orgId, ct);
+        }
     }
 
     public Task<bool> HasActiveRunningTaskInOrganizationAsync(Guid organizationId, CancellationToken ct)

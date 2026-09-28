@@ -32,15 +32,21 @@ public sealed class WorkerDispatchService : IWorkerDispatchService
     {
         lock (_claimLock)
         {
-            // Enforce MVP rule: One active executing task per organization
-            var hasActiveTask = _store.TaskRuns.Values.Any(r =>
+            // Enforce concurrency limit: MaxConcurrentRuns per organization (default 1)
+            var maxConcurrent = 1;
+            if (_store.Organizations.TryGetValue(request.OrganizationId, out var org))
+            {
+                maxConcurrent = org.MaxConcurrentRuns;
+            }
+
+            var activeCount = _store.TaskRuns.Values.Count(r =>
                 r.OrganizationId == request.OrganizationId &&
                 (r.Status == TaskRunStatus.Preparing ||
                  r.Status == TaskRunStatus.Running ||
                  r.Status == TaskRunStatus.AwaitingInput ||
                  r.Status == TaskRunStatus.Cancelling));
 
-            if (hasActiveTask)
+            if (activeCount >= maxConcurrent)
             {
                 return Task.FromResult(new WorkerClaimResponse
                 {
@@ -51,7 +57,8 @@ public sealed class WorkerDispatchService : IWorkerDispatchService
 
             var nextRun = _store.TaskRuns.Values
                 .Where(r => r.OrganizationId == request.OrganizationId && r.Status == TaskRunStatus.Queued)
-                .OrderBy(r => r.RunIndex)
+                .OrderBy(r => r.CreatedAt)
+                .ThenBy(r => r.RunIndex)
                 .FirstOrDefault();
 
             if (nextRun == null)
@@ -76,6 +83,17 @@ public sealed class WorkerDispatchService : IWorkerDispatchService
             nextRun.FencingToken = fencingToken;
             nextRun.LeaseExpiresAtUtc = leaseExpiry;
             nextRun.StartedAt = DateTimeOffset.UtcNow;
+            nextRun.QueuePosition = null;
+
+            var remainingQueued = _store.TaskRuns.Values
+                .Where(r => r.OrganizationId == request.OrganizationId && r.Status == TaskRunStatus.Queued)
+                .OrderBy(r => r.CreatedAt)
+                .ToList();
+
+            for (int i = 0; i < remainingQueued.Count; i++)
+            {
+                remainingQueued[i].QueuePosition = i + 1;
+            }
 
             return Task.FromResult(new WorkerClaimResponse
             {

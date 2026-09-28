@@ -8,6 +8,7 @@ var builder = WebApplication.CreateBuilder(args);
 // Register Core Store & Services
 builder.Services.AddSingleton<IMuniClawStore, InMemoryMuniClawStore>();
 builder.Services.AddScoped<IOrganizationAuthorizationService, OrganizationAuthorizationService>();
+builder.Services.AddScoped<ITaskQueueService, TaskQueueService>();
 builder.Services.AddScoped<ITaskLifecycleService, TaskLifecycleService>();
 builder.Services.AddScoped<IWorkerDispatchService, WorkerDispatchService>();
 builder.Services.AddScoped<IApprovalService, ApprovalService>();
