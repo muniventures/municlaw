@@ -725,6 +725,305 @@ public static class Program
             Assert(threwFencing, "Stale worker upload must be rejected to prevent split-brain");
         });
 
+        // --- T90 Organization-Shared Provider Credentials Qualification Tests ---
+
+        await RunAsyncTest("T90: OrgCredentials: Admin authorization required to register and update shared credentials", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var credService = new ProviderCredentialService(store, auth);
+
+            var adminUser = await auth.GetOrCreateUserAsync("firebase:admin-user", "admin@muni.dev", default);
+            await auth.SetUserAllowlistedAsync(adminUser.Id, true, default);
+            var memberUser = await auth.GetOrCreateUserAsync("firebase:member-user", "member@muni.dev", default);
+            await auth.SetUserAllowlistedAsync(memberUser.Id, true, default);
+
+            var orgId = Guid.NewGuid();
+            store.Organizations[orgId] = new Organization { Id = orgId, Name = "Org Cred Org", Slug = "org-cred-org" };
+            await auth.AddMemberToOrganizationAsync(orgId, adminUser.Id, MembershipRole.Admin, default, allowMultipleMembers: true);
+            await auth.AddMemberToOrganizationAsync(orgId, memberUser.Id, MembershipRole.Member, default, allowMultipleMembers: true);
+
+            // 1. Non-admin member attempts to register org credential -> Rejected
+            bool memberThrew = false;
+            try
+            {
+                await credService.RegisterOrganizationCredentialAsync(new MuniClaw.Core.Contracts.Integrations.RegisterOrganizationCredentialRequest(
+                    orgId.ToString(),
+                    "anthropic",
+                    "Member Key",
+                    "sk-ant-test",
+                    null
+                ), memberUser.Id, default);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                memberThrew = true;
+            }
+            Assert(memberThrew, "Non-admin member cannot register organization credentials");
+
+            // 2. Admin successfully registers org credential
+            var cred = await credService.RegisterOrganizationCredentialAsync(new MuniClaw.Core.Contracts.Integrations.RegisterOrganizationCredentialRequest(
+                orgId.ToString(),
+                "anthropic",
+                "Company Anthropic",
+                "sk-ant-admin-valid",
+                new OrganizationCredentialPolicy
+                {
+                    AllowedModels = new List<string> { "claude-3-5-sonnet*" },
+                    MonthlySpendLimitUsd = 100.00m,
+                    AdminOnly = false
+                }
+            ), adminUser.Id, default);
+
+            Assert(cred != null, "Admin must be able to register organization credential");
+            Assert(cred!.Scope == CredentialScope.Organization, "Scope must be Organization");
+            Assert(cred.Policy?.MonthlySpendLimitUsd == 100.00m, "Spend limit matches");
+
+            // 3. Member attempts to update policy -> Rejected
+            bool updateThrew = false;
+            try
+            {
+                await credService.UpdatePolicyAsync(cred.Id, new OrganizationCredentialPolicy
+                {
+                    MonthlySpendLimitUsd = 999.00m
+                }, memberUser.Id, default);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                updateThrew = true;
+            }
+            Assert(updateThrew, "Non-admin member cannot update organization credential policy");
+        });
+
+        await RunAsyncTest("T90: OrgCredentials: Model allowlist policy enforced on task creation", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var credService = new ProviderCredentialService(store, auth);
+            var lifecycle = new TaskLifecycleService(store, auth);
+
+            var (orgId, adminId, projId, _) = await SetupOrgProjectAndCredential(store, auth);
+
+            // Register org credential with model restriction: only claude-3-5-sonnet*
+            var orgCred = await credService.RegisterOrganizationCredentialAsync(new MuniClaw.Core.Contracts.Integrations.RegisterOrganizationCredentialRequest(
+                orgId.ToString(),
+                "anthropic",
+                "Restricted Models Key",
+                "sk-ant-test-key",
+                new OrganizationCredentialPolicy
+                {
+                    AllowedModels = new List<string> { "claude-3-5-sonnet*" },
+                    MonthlySpendLimitUsd = 50.00m,
+                    AdminOnly = false
+                }
+            ), adminId, default);
+
+            // 1. Task requested with disallowed model: "gpt-4o" -> Rejected
+            bool disallowedThrew = false;
+            try
+            {
+                await lifecycle.CreateTaskAsync(new CreateTaskRequest
+                {
+                    OrganizationId = orgId,
+                    ProjectId = projId,
+                    UserId = adminId,
+                    Title = "Disallowed model task",
+                    BaseBranch = "main",
+                    ProviderCredentialReferenceId = orgCred.Id,
+                    Model = "gpt-4o",
+                    Instruction = "Write code",
+                    HarnessVersion = "1.18.32"
+                }, default);
+            }
+            catch (InvalidOperationException ex)
+            {
+                disallowedThrew = true;
+                Assert(ex.Message.Contains("not allowed", StringComparison.OrdinalIgnoreCase), $"Expected 'not allowed' in message: {ex.Message}");
+            }
+            Assert(disallowedThrew, "Task with model not in AllowedModels policy must be rejected");
+
+            // 2. Task requested with allowed model matching wildcard prefix: "claude-3-5-sonnet-20241022" -> Allowed
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = adminId,
+                Title = "Allowed model task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = orgCred.Id,
+                Model = "claude-3-5-sonnet-20241022",
+                Instruction = "Write code",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(task != null && run != null, "Task with allowed model created successfully");
+        });
+
+        await RunAsyncTest("T90: OrgCredentials: Monthly spend budget cap prevents over-limit task creation", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var credService = new ProviderCredentialService(store, auth);
+            var lifecycle = new TaskLifecycleService(store, auth);
+
+            var (orgId, adminId, projId, _) = await SetupOrgProjectAndCredential(store, auth);
+
+            // Org credential with $10 limit and already spent $10
+            var orgCred = await credService.RegisterOrganizationCredentialAsync(new MuniClaw.Core.Contracts.Integrations.RegisterOrganizationCredentialRequest(
+                orgId.ToString(),
+                "openai",
+                "Budgeted Key",
+                "sk-proj-test",
+                new OrganizationCredentialPolicy
+                {
+                    AllowedModels = new List<string> { "*" },
+                    MonthlySpendLimitUsd = 10.00m,
+                    AdminOnly = false
+                }
+            ), adminId, default);
+
+            // Record $10 spend to exhaust budget
+            await credService.RecordSpendAsync(orgId, orgCred.Id, 10.00m, default);
+
+            bool budgetThrew = false;
+            try
+            {
+                await lifecycle.CreateTaskAsync(new CreateTaskRequest
+                {
+                    OrganizationId = orgId,
+                    ProjectId = projId,
+                    UserId = adminId,
+                    Title = "Exceeded budget task",
+                    BaseBranch = "main",
+                    ProviderCredentialReferenceId = orgCred.Id,
+                    Model = "gpt-4o",
+                    Instruction = "Write code",
+                    HarnessVersion = "1.18.32"
+                }, default);
+            }
+            catch (InvalidOperationException ex)
+            {
+                budgetThrew = true;
+                Assert(ex.Message.Contains("monthly spend limit", StringComparison.OrdinalIgnoreCase), $"Expected 'monthly spend limit' in message: {ex.Message}");
+            }
+            Assert(budgetThrew, "Task creation must be rejected when monthly spend limit is reached");
+        });
+
+        await RunAsyncTest("T90: OrgCredentials: Non-admin member cannot use AdminOnly credential", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var credService = new ProviderCredentialService(store, auth);
+            var lifecycle = new TaskLifecycleService(store, auth);
+
+            var admin = await auth.GetOrCreateUserAsync("firebase:admin-ao", "admin-ao@muni.dev", default);
+            await auth.SetUserAllowlistedAsync(admin.Id, true, default);
+            var member = await auth.GetOrCreateUserAsync("firebase:member-ao", "member-ao@muni.dev", default);
+            await auth.SetUserAllowlistedAsync(member.Id, true, default);
+
+            var orgId = Guid.NewGuid();
+            store.Organizations[orgId] = new Organization { Id = orgId, Name = "AO Org", Slug = "ao-org" };
+            await auth.AddMemberToOrganizationAsync(orgId, admin.Id, MembershipRole.Admin, default, allowMultipleMembers: true);
+            await auth.AddMemberToOrganizationAsync(orgId, member.Id, MembershipRole.Member, default, allowMultipleMembers: true);
+
+            var repoId = Guid.NewGuid();
+            store.RepositoryConnections[repoId] = new RepositoryConnection
+            {
+                Id = repoId,
+                OrganizationId = orgId,
+                GitHost = GitHostType.GitHub,
+                ExternalAccountId = "acc-1",
+                RepositoryId = "repo-1",
+                RepositoryFullName = "muniventures/ao-repo",
+                DefaultBranch = "main",
+                SecretReferencePath = "secret/repo"
+            };
+            var projId = Guid.NewGuid();
+            store.Projects[projId] = new Project { Id = projId, OrganizationId = orgId, RepositoryConnectionId = repoId, Name = "AO Proj", DefaultBaseBranch = "main" };
+
+            // Admin registers AdminOnly credential
+            var orgCred = await credService.RegisterOrganizationCredentialAsync(new MuniClaw.Core.Contracts.Integrations.RegisterOrganizationCredentialRequest(
+                orgId.ToString(),
+                "openai",
+                "Admin-Only Secret Key",
+                "sk-proj-admin",
+                new OrganizationCredentialPolicy
+                {
+                    AllowedModels = new List<string> { "*" },
+                    MonthlySpendLimitUsd = null,
+                    AdminOnly = true
+                }
+            ), admin.Id, default);
+
+            // Member queries accessible credentials -> AdminOnly credential is filtered out!
+            var accessible = await credService.GetAccessibleCredentialsAsync(member.Id, orgId, default);
+            Assert(!accessible.Any(c => c.Id == orgCred.Id), "Member must not see AdminOnly organization credential");
+
+            // Member attempts to force use the AdminOnly credential -> Rejected
+            bool useThrew = false;
+            try
+            {
+                await lifecycle.CreateTaskAsync(new CreateTaskRequest
+                {
+                    OrganizationId = orgId,
+                    ProjectId = projId,
+                    UserId = member.Id,
+                    Title = "Admin-only intrusion",
+                    BaseBranch = "main",
+                    ProviderCredentialReferenceId = orgCred.Id,
+                    Model = "gpt-4o",
+                    Instruction = "Write code",
+                    HarnessVersion = "1.18.32"
+                }, default);
+            }
+            catch (InvalidOperationException)
+            {
+                useThrew = true;
+            }
+            Assert(useThrew, "Member must be denied from creating task with AdminOnly credential");
+        });
+
+        await RunAsyncTest("T90: OrgCredentials: Revoking shared credential terminates active task runs", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var credService = new ProviderCredentialService(store, auth);
+            var lifecycle = new TaskLifecycleService(store, auth);
+
+            var (orgId, adminId, projId, _) = await SetupOrgProjectAndCredential(store, auth);
+
+            var orgCred = await credService.RegisterOrganizationCredentialAsync(new MuniClaw.Core.Contracts.Integrations.RegisterOrganizationCredentialRequest(
+                orgId.ToString(),
+                "openai",
+                "Shared Revoke Key",
+                "sk-proj-revoke",
+                new OrganizationCredentialPolicy { AllowedModels = new List<string> { "*" } }
+            ), adminId, default);
+
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = adminId,
+                Title = "Active task to revoke",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = orgCred.Id,
+                Model = "gpt-4o",
+                Instruction = "Write code",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            // Simulate run running
+            run.Status = TaskRunStatus.Running;
+
+            // Admin revokes the credential
+            await credService.RevokeCredentialAsync(orgCred.Id, adminId, default);
+
+            var revokedCred = store.ProviderCredentials[orgCred.Id];
+            Assert(revokedCred.IsRevoked, "Credential must be marked revoked");
+            Assert(run.Status == TaskRunStatus.Failed, "Active run using revoked credential must be terminated to Failed");
+        });
+
         Console.WriteLine("\n-------------------------------------------------");
         Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
         Console.WriteLine("-------------------------------------------------");

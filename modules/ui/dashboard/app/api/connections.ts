@@ -1,10 +1,14 @@
 import { apiClient } from "./client";
 import type {
   CredentialScope,
+  OrganizationCredentialPolicy,
   Project,
   ProviderCredentialReference,
+  RegisterOrganizationCredentialRequest,
   RepositoryConnection,
+  UpdateCredentialPolicyRequest,
 } from "./types";
+import { getRuntimeConfig } from "@/core/config/runtime";
 
 export interface RegisterKeyPayload {
   userId: string;
@@ -51,6 +55,168 @@ export async function revokeCredential(
       params: { userId },
     }
   );
+}
+
+export async function getOrganizationCredentials(
+  orgId: string
+): Promise<ProviderCredentialReference[]> {
+  try {
+    return await apiClient<ProviderCredentialReference[]>(
+      `/api/v1/organizations/${orgId}/credentials/organization`
+    );
+  } catch {
+    try {
+      return await apiClient<ProviderCredentialReference[]>(
+        `/api/v1/credentials/organization`,
+        { params: { organizationId: orgId } }
+      );
+    } catch {
+      // Fallback: list all credentials for org and filter by Organization scope
+      const creds = await listCredentials(orgId, "").catch(() => []);
+      return creds.filter((c) => c.scope === "Organization");
+    }
+  }
+}
+
+export async function registerOrganizationCredential(
+  orgId: string,
+  payload: RegisterOrganizationCredentialRequest
+): Promise<ProviderCredentialReference> {
+  const body = {
+    ...payload,
+    scope: "Organization" as CredentialScope,
+    organizationId: orgId,
+  };
+
+  try {
+    return await apiClient<ProviderCredentialReference>(
+      `/api/v1/organizations/${orgId}/credentials/organization`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      }
+    );
+  } catch {
+    try {
+      return await apiClient<ProviderCredentialReference>(
+        `/api/v1/credentials/organization`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        }
+      );
+    } catch {
+      // Fallback to standard credentials endpoint with scope: "Organization"
+      return await apiClient<ProviderCredentialReference>(
+        `/api/v1/organizations/${orgId}/credentials`,
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        }
+      );
+    }
+  }
+}
+
+export async function updateCredentialPolicy(
+  orgId: string,
+  credentialId: string,
+  policy: OrganizationCredentialPolicy | UpdateCredentialPolicyRequest
+): Promise<ProviderCredentialReference> {
+  try {
+    return await apiClient<ProviderCredentialReference>(
+      `/api/v1/organizations/${orgId}/credentials/organization/${credentialId}/policy`,
+      {
+        method: "PUT",
+        body: JSON.stringify(policy),
+      }
+    );
+  } catch {
+    try {
+      return await apiClient<ProviderCredentialReference>(
+        `/api/v1/credentials/organization/${credentialId}/policy`,
+        {
+          method: "PUT",
+          params: { organizationId: orgId },
+          body: JSON.stringify(policy),
+        }
+      );
+    } catch {
+      return await apiClient<ProviderCredentialReference>(
+        `/api/v1/organizations/${orgId}/credentials/${credentialId}/policy`,
+        {
+          method: "PUT",
+          body: JSON.stringify(policy),
+        }
+      );
+    }
+  }
+}
+
+export async function getAccessibleCredentials(
+  orgId: string
+): Promise<ProviderCredentialReference[]> {
+  try {
+    return await apiClient<ProviderCredentialReference[]>(
+      `/api/v1/organizations/${orgId}/credentials/accessible`
+    );
+  } catch {
+    try {
+      return await apiClient<ProviderCredentialReference[]>(
+        `/api/v1/credentials/accessible`,
+        { params: { organizationId: orgId } }
+      );
+    } catch {
+      // Fallback: merge personal and organization credentials
+      const userId = getRuntimeConfig().defaultUserId;
+      const [personalCreds, orgCreds] = await Promise.all([
+        listCredentials(orgId, userId).catch(() => []),
+        getOrganizationCredentials(orgId).catch(() => []),
+      ]);
+
+      const seen = new Set<string>();
+      const combined: ProviderCredentialReference[] = [];
+
+      for (const cred of [...personalCreds, ...orgCreds]) {
+        if (!seen.has(cred.id) && !cred.isRevoked) {
+          seen.add(cred.id);
+          combined.push(cred);
+        }
+      }
+      return combined;
+    }
+  }
+}
+
+export async function revokeOrganizationCredential(
+  orgId: string,
+  credentialId: string,
+  userId?: string
+): Promise<{ status: string; credentialId: string }> {
+  try {
+    return await apiClient<{ status: string; credentialId: string }>(
+      `/api/v1/organizations/${orgId}/credentials/organization/${credentialId}`,
+      {
+        method: "DELETE",
+      }
+    );
+  } catch {
+    try {
+      return await apiClient<{ status: string; credentialId: string }>(
+        `/api/v1/credentials/organization/${credentialId}`,
+        {
+          method: "DELETE",
+          params: { organizationId: orgId },
+        }
+      );
+    } catch {
+      return await revokeCredential(
+        orgId,
+        credentialId,
+        userId || getRuntimeConfig().defaultUserId
+      );
+    }
+  }
 }
 
 export async function listProjects(

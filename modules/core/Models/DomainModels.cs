@@ -106,6 +106,14 @@ public enum CredentialScope
     Organization
 }
 
+public sealed class OrganizationCredentialPolicy
+{
+    public List<string> AllowedModels { get; set; } = ["*"];
+    public decimal? MonthlySpendLimitUsd { get; set; }
+    public decimal CurrentSpendUsd { get; set; } = 0m;
+    public bool AdminOnly { get; set; } = false;
+}
+
 public sealed class ProviderCredentialReference
 {
     public required Guid Id { get; set; }
@@ -114,8 +122,10 @@ public sealed class ProviderCredentialReference
     public required string ProviderName { get; set; }
     public required string Label { get; set; }
     public CredentialScope Scope { get; set; } = CredentialScope.Personal;
+    public OrganizationCredentialPolicy? Policy { get; set; }
     public required string SecretReferencePath { get; set; }
     public bool IsRevoked { get; set; } = false;
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? RevokedAt { get; set; }
 }
+

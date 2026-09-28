@@ -8,7 +8,7 @@ public interface IOrganizationAuthorizationService
     Task<User> GetOrCreateUserAsync(string externalSubjectId, string email, CancellationToken ct);
     Task<bool> IsUserAllowlistedAsync(Guid userId, CancellationToken ct);
     Task SetUserAllowlistedAsync(Guid userId, bool isAllowlisted, CancellationToken ct);
-    Task<OrganizationMembership> AddMemberToOrganizationAsync(Guid organizationId, Guid userId, MembershipRole role, CancellationToken ct);
+    Task<OrganizationMembership> AddMemberToOrganizationAsync(Guid organizationId, Guid userId, MembershipRole role, CancellationToken ct, bool allowMultipleMembers = false);
     Task<bool> CanAccessOrganizationAsync(Guid userId, Guid organizationId, CancellationToken ct);
     Task<bool> IsOrganizationAdminAsync(Guid userId, Guid organizationId, CancellationToken ct);
 }
@@ -69,7 +69,7 @@ public sealed class OrganizationAuthorizationService : IOrganizationAuthorizatio
         return Task.CompletedTask;
     }
 
-    public Task<OrganizationMembership> AddMemberToOrganizationAsync(Guid organizationId, Guid userId, MembershipRole role, CancellationToken ct)
+    public Task<OrganizationMembership> AddMemberToOrganizationAsync(Guid organizationId, Guid userId, MembershipRole role, CancellationToken ct, bool allowMultipleMembers = false)
     {
         lock (_lock)
         {
@@ -88,15 +88,18 @@ public sealed class OrganizationAuthorizationService : IOrganizationAuthorizatio
                 throw new UnauthorizedAccessException($"User {userId} is not allowlisted for MuniClaw.");
             }
 
-            // MVP Rule: Policy admits at most ONE active user membership per organization
             var activeMembers = _store.Memberships.Values
                 .Where(m => m.OrganizationId == organizationId && m.IsActive)
                 .ToList();
 
-            if (activeMembers.Any(m => m.UserId != userId))
+            if (!allowMultipleMembers)
             {
-                throw new InvalidOperationException(
-                    $"Organization {organizationId} already has an active member. The MVP policy allows at most one active membership per organization.");
+                // MVP Rule: Policy admits at most ONE active user membership per organization
+                if (activeMembers.Any(m => m.UserId != userId))
+                {
+                    throw new InvalidOperationException(
+                        $"Organization {organizationId} already has an active member. The MVP policy allows at most one active membership per organization.");
+                }
             }
 
             var existingMembership = activeMembers.FirstOrDefault(m => m.UserId == userId);

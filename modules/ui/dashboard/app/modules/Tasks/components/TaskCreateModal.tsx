@@ -1,11 +1,21 @@
 import * as React from "react";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { AlertTriangle, Shield, ShieldAlert } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
 import type { Project, ProviderCredentialReference } from "@/api/types";
 import { createTask, type CreateTaskPayload } from "@/api/tasks";
+import { getAccessibleCredentials } from "@/api/connections";
 
 interface TaskCreateModalProps {
   open: boolean;
@@ -13,7 +23,7 @@ interface TaskCreateModalProps {
   organizationId: string;
   userId: string;
   projects: Project[];
-  credentials: ProviderCredentialReference[];
+  credentials?: ProviderCredentialReference[];
   onTaskCreated: (taskId: string) => void;
 }
 
@@ -22,7 +32,58 @@ const SUPPORTED_MODELS = [
   { id: "claude-3-5-sonnet", name: "Anthropic Claude 3.5 Sonnet" },
   { id: "gpt-4o", name: "OpenAI GPT-4o" },
   { id: "gpt-4.5-preview", name: "OpenAI GPT-4.5 Preview" },
+  { id: "deepseek-chat", name: "DeepSeek Chat (V3 / R1)" },
 ];
+
+function isModelAllowed(
+  selectedModel: string,
+  credential?: ProviderCredentialReference
+): { allowed: boolean; reason?: string } {
+  if (!credential || credential.scope !== "Organization" || !credential.policy) {
+    return { allowed: true };
+  }
+
+  const allowedModels = credential.policy.allowedModels;
+  if (!allowedModels || allowedModels.length === 0 || allowedModels.includes("*")) {
+    return { allowed: true };
+  }
+
+  const match = allowedModels.some((allowed) => {
+    if (allowed === "*") return true;
+    if (allowed.endsWith("*")) {
+      const prefix = allowed.slice(0, -1);
+      return selectedModel.startsWith(prefix);
+    }
+    return allowed.toLowerCase() === selectedModel.toLowerCase();
+  });
+
+  if (!match) {
+    return {
+      allowed: false,
+      reason: `Selected model '${selectedModel}' is not allowed by this organization key's policy. Allowed models: ${allowedModels.join(", ")}`,
+    };
+  }
+
+  return { allowed: true };
+}
+
+function isBudgetCapExceeded(
+  credential?: ProviderCredentialReference
+): { exceeded: boolean; reason?: string } {
+  if (!credential || credential.scope !== "Organization" || !credential.policy) {
+    return { exceeded: false };
+  }
+  const { monthlySpendLimitUsd, currentSpendUsd } = credential.policy;
+  if (monthlySpendLimitUsd != null && monthlySpendLimitUsd > 0) {
+    if (currentSpendUsd >= monthlySpendLimitUsd) {
+      return {
+        exceeded: true,
+        reason: `Monthly spend limit ($${monthlySpendLimitUsd.toFixed(2)}) has been reached for this organization key ($${currentSpendUsd.toFixed(2)} spent).`,
+      };
+    }
+  }
+  return { exceeded: false };
+}
 
 export function TaskCreateModal({
   open,
@@ -30,7 +91,7 @@ export function TaskCreateModal({
   organizationId,
   userId,
   projects,
-  credentials,
+  credentials = [],
   onTaskCreated,
 }: TaskCreateModalProps) {
   const [projectId, setProjectId] = React.useState(projects[0]?.id || "");
@@ -39,6 +100,9 @@ export function TaskCreateModal({
     projects[0]?.defaultBaseBranch || "main"
   );
   const [model, setModel] = React.useState(SUPPORTED_MODELS[0].id);
+  const [credentialsList, setCredentialsList] = React.useState<ProviderCredentialReference[]>(
+    credentials
+  );
   const [credentialId, setCredentialId] = React.useState(
     credentials[0]?.id || ""
   );
@@ -47,6 +111,7 @@ export function TaskCreateModal({
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
+  // Sync projects
   React.useEffect(() => {
     if (projects.length > 0 && !projectId) {
       setProjectId(projects[0].id);
@@ -54,11 +119,45 @@ export function TaskCreateModal({
     }
   }, [projects, projectId]);
 
+  // Sync prop credentials if provided
   React.useEffect(() => {
-    if (credentials.length > 0 && !credentialId) {
-      setCredentialId(credentials[0].id);
+    if (credentials.length > 0) {
+      setCredentialsList(credentials);
     }
-  }, [credentials, credentialId]);
+  }, [credentials]);
+
+  // Fetch accessible credentials whenever modal opens or organizationId changes
+  React.useEffect(() => {
+    if (!open) return;
+    let isCancelled = false;
+
+    getAccessibleCredentials(organizationId)
+      .then((accessible) => {
+        if (!isCancelled && accessible && accessible.length > 0) {
+          setCredentialsList(accessible);
+        }
+      })
+      .catch(() => {
+        // Keep existing credentialsList if accessible fetch fails
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [open, organizationId]);
+
+  // Ensure an active credential is selected
+  React.useEffect(() => {
+    if (credentialsList.length > 0) {
+      if (!credentialId || !credentialsList.some((c) => c.id === credentialId)) {
+        setCredentialId(credentialsList[0].id);
+      }
+    }
+  }, [credentialsList, credentialId]);
+
+  const selectedCred = credentialsList.find((c) => c.id === credentialId);
+  const modelCheck = isModelAllowed(model, selectedCred);
+  const budgetCheck = isBudgetCapExceeded(selectedCred);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -72,6 +171,14 @@ export function TaskCreateModal({
     }
     if (!credentialId) {
       setError("Please register or select a provider API key in Connections.");
+      return;
+    }
+    if (!modelCheck.allowed) {
+      setError(modelCheck.reason || "Selected model is not permitted by this organization key.");
+      return;
+    }
+    if (budgetCheck.exceeded) {
+      setError(budgetCheck.reason || "This organization key has reached its monthly spend limit.");
       return;
     }
 
@@ -194,7 +301,7 @@ export function TaskCreateModal({
                 <label htmlFor="task-credential" className="block text-xs font-semibold text-foreground mb-1.5">
                   Provider Key (BYOK)
                 </label>
-                {credentials.length === 0 ? (
+                {credentialsList.length === 0 ? (
                   <div className="text-xs text-amber-600 bg-amber-500/10 p-2 rounded border border-amber-500/20">
                     No keys registered. Go to Connections to add your write-only key.
                   </div>
@@ -204,15 +311,74 @@ export function TaskCreateModal({
                     value={credentialId}
                     onChange={(e) => setCredentialId(e.target.value)}
                   >
-                    {credentials.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.label} ({c.providerName})
-                      </option>
-                    ))}
+                    {credentialsList.map((c) => {
+                      const isOrg = c.scope === "Organization";
+                      const prefix = isOrg ? "[Org Shared]" : "[Personal]";
+                      return (
+                        <option key={c.id} value={c.id}>
+                          {prefix} {c.label} ({c.providerName})
+                        </option>
+                      );
+                    })}
                   </Select>
                 )}
               </div>
             </div>
+
+            {/* Selected Credential Policy info & Badges */}
+            {selectedCred && (
+              <div className="p-2.5 rounded-lg bg-muted/40 border border-border flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground font-medium">Selected Credential:</span>
+                  <Badge
+                    variant={selectedCred.scope === "Organization" ? "info" : "secondary"}
+                    className="text-[10px]"
+                  >
+                    {selectedCred.scope === "Organization" ? "[Org Shared]" : "[Personal]"}
+                  </Badge>
+                  {selectedCred.scope === "Organization" && selectedCred.policy?.adminOnly && (
+                    <Badge variant="warning" className="text-[10px] gap-1">
+                      <ShieldAlert className="h-3 w-3" /> Admin Only
+                    </Badge>
+                  )}
+                  {selectedCred.scope === "Organization" && !selectedCred.policy?.adminOnly && (
+                    <Badge variant="secondary" className="text-[10px] gap-1">
+                      <Shield className="h-3 w-3 text-emerald-600" /> All Members
+                    </Badge>
+                  )}
+                </div>
+
+                {selectedCred.scope === "Organization" && selectedCred.policy && (
+                  <div className="text-[11px] text-muted-foreground font-mono">
+                    Spend: ${selectedCred.policy.currentSpendUsd.toFixed(2)}
+                    {selectedCred.policy.monthlySpendLimitUsd != null &&
+                      ` / $${selectedCred.policy.monthlySpendLimitUsd.toFixed(2)}`}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Model Policy Validation Warning */}
+            {!modelCheck.allowed && (
+              <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 text-xs flex items-start gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">Model Policy Restriction</p>
+                  <p className="mt-0.5">{modelCheck.reason}</p>
+                </div>
+              </div>
+            )}
+
+            {/* Budget Cap Warning */}
+            {budgetCheck.exceeded && (
+              <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-xs flex items-start gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">Budget Cap Exceeded</p>
+                  <p className="mt-0.5">{budgetCheck.reason}</p>
+                </div>
+              </div>
+            )}
 
             {/* Instruction Prompt */}
             <div>
@@ -256,7 +422,10 @@ export function TaskCreateModal({
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={isSubmitting}>
+            <Button
+              type="submit"
+              disabled={isSubmitting || !modelCheck.allowed || budgetCheck.exceeded}
+            >
               {isSubmitting ? "Dispatching..." : "Launch Task"}
             </Button>
           </DialogFooter>

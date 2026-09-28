@@ -62,6 +62,30 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
             throw new InvalidOperationException("Valid active provider credential reference is required.");
         }
 
+        if (cred.Scope == CredentialScope.Organization)
+        {
+            var policy = cred.Policy ?? new OrganizationCredentialPolicy();
+
+            if (policy.AdminOnly)
+            {
+                var isAdmin = await _auth.IsOrganizationAdminAsync(request.UserId, request.OrganizationId, ct);
+                if (!isAdmin)
+                {
+                    throw new InvalidOperationException("Organization credential policy restricts usage to organization administrators.");
+                }
+            }
+
+            if (!IsModelAllowed(request.Model, policy.AllowedModels))
+            {
+                throw new InvalidOperationException($"Requested model '{request.Model}' is not allowed by organization credential policy.");
+            }
+
+            if (policy.MonthlySpendLimitUsd.HasValue && policy.CurrentSpendUsd >= policy.MonthlySpendLimitUsd.Value)
+            {
+                throw new InvalidOperationException($"Organization credential monthly spend limit of ${policy.MonthlySpendLimitUsd.Value:F2} exceeded (current spend: ${policy.CurrentSpendUsd:F2}).");
+            }
+        }
+
         lock (_lock)
         {
             // Idempotent duplicate check: if a task with the exact title already exists created in the last 60s
@@ -142,6 +166,29 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
             {
                 throw new InvalidOperationException($"Cannot create a follow-up while run {latestRun.Id} is still in progress ({latestRun.Status}).");
             }
+
+            if (_store.ProviderCredentials.TryGetValue(latestRun.ProviderCredentialReferenceId, out var cred))
+            {
+                if (cred.IsRevoked)
+                {
+                    throw new InvalidOperationException("Provider credential has been revoked.");
+                }
+
+                if (cred.Scope == CredentialScope.Organization)
+                {
+                    var policy = cred.Policy ?? new OrganizationCredentialPolicy();
+                    if (policy.AdminOnly && !_auth.IsOrganizationAdminAsync(userId, task.OrganizationId, ct).GetAwaiter().GetResult())
+                    {
+                        throw new InvalidOperationException("Organization credential policy restricts usage to organization administrators.");
+                    }
+
+                    if (policy.MonthlySpendLimitUsd.HasValue && policy.CurrentSpendUsd >= policy.MonthlySpendLimitUsd.Value)
+                    {
+                        throw new InvalidOperationException($"Organization credential monthly spend limit of ${policy.MonthlySpendLimitUsd.Value:F2} exceeded (current spend: ${policy.CurrentSpendUsd:F2}).");
+                    }
+                }
+            }
+
 
             var newRun = new TaskRun
             {
@@ -234,4 +281,47 @@ public sealed class TaskLifecycleService : ITaskLifecycleService
         }
         return Task.FromResult<TaskRun?>(null);
     }
+
+    private static bool IsModelAllowed(string requestedModel, IReadOnlyList<string>? allowedModels)
+    {
+        if (allowedModels == null || allowedModels.Count == 0)
+        {
+            return true;
+        }
+
+        foreach (var pattern in allowedModels)
+        {
+            if (string.IsNullOrWhiteSpace(pattern))
+            {
+                continue;
+            }
+
+            var trimmed = pattern.Trim();
+            if (trimmed == "*")
+            {
+                return true;
+            }
+
+            if (string.Equals(requestedModel, trimmed, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (trimmed.EndsWith('*'))
+            {
+                var prefix = trimmed[..^1];
+                if (requestedModel.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            else if (requestedModel.StartsWith(trimmed, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
+

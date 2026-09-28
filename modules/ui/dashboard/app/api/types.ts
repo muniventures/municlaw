@@ -87,6 +87,30 @@ export interface Project {
   repositoryConnection?: RepositoryConnection;
 }
 
+export interface OrganizationCredentialPolicy {
+  allowedModels: string[];
+  monthlySpendLimitUsd?: number | null;
+  currentSpendUsd: number;
+  adminOnly: boolean;
+}
+
+export interface RegisterOrganizationCredentialRequest {
+  providerName: string;
+  label: string;
+  apiKey: string;
+  policy?: OrganizationCredentialPolicy;
+  allowedModels?: string[];
+  monthlySpendLimitUsd?: number | null;
+  adminOnly?: boolean;
+}
+
+export interface UpdateCredentialPolicyRequest {
+  allowedModels: string[];
+  monthlySpendLimitUsd?: number | null;
+  adminOnly: boolean;
+  currentSpendUsd?: number;
+}
+
 export interface ProviderCredentialReference {
   id: string;
   organizationId: string;
@@ -97,6 +121,7 @@ export interface ProviderCredentialReference {
   isRevoked: boolean;
   createdAt: string;
   revokedAt?: string;
+  policy?: OrganizationCredentialPolicy;
 }
 
 export interface TaskEntity {

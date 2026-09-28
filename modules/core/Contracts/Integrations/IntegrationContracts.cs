@@ -1,3 +1,5 @@
+using MuniClaw.Core.Models;
+
 namespace MuniClaw.Core.Contracts.Integrations;
 
 public enum ModelProviderType
@@ -80,3 +82,17 @@ public interface IGitProviderClient
 {
     Task<ReviewedPublicationResult> PublishDraftPullRequestAsync(ReviewedPublicationRequest request, CancellationToken ct);
 }
+
+public sealed record RegisterOrganizationCredentialRequest(
+    string OrganizationId,
+    string Provider,
+    string Label,
+    string ApiKey,
+    OrganizationCredentialPolicy? Policy = null)
+{
+    public string? UserId { get; init; }
+}
+
+public sealed record UpdateCredentialPolicyRequest(
+    OrganizationCredentialPolicy Policy);
+
