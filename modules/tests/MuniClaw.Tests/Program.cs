@@ -1024,6 +1024,189 @@ public static class Program
             Assert(run.Status == TaskRunStatus.Failed, "Active run using revoked credential must be terminated to Failed");
         });
 
+        // --- T90 Self-Host Distribution & Standalone Adapters Qualification Tests ---
+
+        await RunAsyncTest("T90: SelfHost: MuniClawFileStore restart persistence and atomic recovery", async () =>
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), $"municlaw-test-store-{Guid.NewGuid():N}");
+            try
+            {
+                var store1 = new MuniClawFileStore(tempDir);
+                var orgId = Guid.NewGuid();
+                var userId = Guid.NewGuid();
+                var projId = Guid.NewGuid();
+
+                store1.Organizations[orgId] = new Organization { Id = orgId, Name = "Self-Host Org", Slug = "self-host-org" };
+                store1.Users[userId] = new User { Id = userId, ExternalSubjectId = "selfhost:u1", Email = "admin@selfhost.local", IsAllowlisted = true };
+                store1.Projects[projId] = new Project { Id = projId, OrganizationId = orgId, RepositoryConnectionId = Guid.NewGuid(), Name = "On-Prem Project", DefaultBaseBranch = "main" };
+
+                store1.StoreOrganizationCredential(new ProviderCredentialReference
+                {
+                    Id = Guid.NewGuid(),
+                    OrganizationId = orgId,
+                    OwningUserId = userId,
+                    ProviderName = "openai",
+                    Label = "On-Prem Shared OpenAI",
+                    Scope = CredentialScope.Organization,
+                    SecretReferencePath = "local/secrets/org1",
+                    Policy = new OrganizationCredentialPolicy
+                    {
+                        AllowedModels = new List<string> { "gpt-4o" },
+                        MonthlySpendLimitUsd = 250.00m,
+                        AdminOnly = false
+                    }
+                });
+
+                // Persist snapshot to disk
+                store1.SaveSnapshot();
+
+                // Verify snapshot file exists
+                var snapshotFile = Path.Combine(tempDir, "snapshot.json");
+                Assert(File.Exists(snapshotFile), "snapshot.json must exist on disk");
+
+                // Simulate reboot: instantiate store2 from same directory
+                var store2 = new MuniClawFileStore(tempDir);
+                Assert(store2.Organizations.ContainsKey(orgId), "Organization restored after restart");
+                Assert(store2.Users.ContainsKey(userId), "User restored after restart");
+                Assert(store2.Projects.ContainsKey(projId), "Project restored after restart");
+
+                var restoredCreds = store2.GetOrganizationCredentials(orgId.ToString());
+                Assert(restoredCreds.Count == 1, "Organization credential restored after restart");
+                Assert(restoredCreds[0].Policy?.MonthlySpendLimitUsd == 250.00m, "Credential policy restored accurately");
+
+                // Test atomic concurrent writes
+                var tasks = Enumerable.Range(0, 5).Select(_ => Task.Run(() => store2.SaveSnapshot()));
+                await Task.WhenAll(tasks);
+                Assert(File.Exists(snapshotFile), "snapshot.json intact after concurrent writes");
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        });
+
+        await RunAsyncTest("T90: SelfHost: LocalEncryptedSecretStore AES-256-GCM encryption and zero-leakage", async () =>
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), $"municlaw-test-secrets-{Guid.NewGuid():N}");
+            try
+            {
+                var masterKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                var secretStore = new LocalEncryptedSecretStore(tempDir, masterKeyHex);
+
+                var secretPath = "municlaw/org-42/credentials/cred-99";
+                var sensitiveToken = "sk-live-super-secret-model-token-987654321";
+                var payload = new Dictionary<string, string>
+                {
+                    { "api_key", sensitiveToken },
+                    { "provider", "anthropic" }
+                };
+
+                await secretStore.StoreSecretAsync(secretPath, payload, default);
+
+                // 1. Inspect on-disk raw file: verify sensitiveToken is encrypted and NOT in plaintext
+                var files = Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories);
+                Assert(files.Length == 1, "Exactly one encrypted secret file created");
+                var rawBytes = await File.ReadAllBytesAsync(files[0]);
+                var rawString = System.Text.Encoding.UTF8.GetString(rawBytes);
+                Assert(!rawString.Contains(sensitiveToken), "Plaintext secret token must NEVER be visible in encrypted file");
+
+                // 2. Read back using valid key -> succeeds and recovers payload
+                var recovered = await secretStore.GetSecretAsync(secretPath, default);
+                Assert(recovered != null, "Recovered secret must not be null");
+                Assert(recovered!["api_key"] == sensitiveToken, "Decrypted token matches original value");
+                Assert(recovered["provider"] == "anthropic", "Decrypted metadata matches original value");
+
+                // 3. Delete secret -> file removed
+                await secretStore.DeleteSecretAsync(secretPath, default);
+                var afterDelete = await secretStore.GetSecretAsync(secretPath, default);
+                Assert(afterDelete == null, "Deleted secret returns null");
+                Assert(!File.Exists(files[0]), "Secret file physically removed from disk");
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        });
+
+        await RunAsyncTest("T90: SelfHost: LocalEncryptedSecretStore cryptographic tamper detection", async () =>
+        {
+            var tempDir = Path.Combine(Path.GetTempPath(), $"municlaw-test-tamper-{Guid.NewGuid():N}");
+            try
+            {
+                var keyA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+                var keyB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+                var storeA = new LocalEncryptedSecretStore(tempDir, keyA);
+                var secretPath = "municlaw/tamper-test";
+                await storeA.StoreSecretAsync(secretPath, new Dictionary<string, string> { { "key", "val" } }, default);
+
+                var files = Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories);
+                Assert(files.Length == 1, "Secret file written");
+
+                // 1. Decrypt with different master key -> throws CryptographicException
+                var storeB = new LocalEncryptedSecretStore(tempDir, keyB);
+                bool threwWrongKey = false;
+                try
+                {
+                    await storeB.GetSecretAsync(secretPath, default);
+                }
+                catch (System.Security.Cryptography.CryptographicException)
+                {
+                    threwWrongKey = true;
+                }
+                Assert(threwWrongKey, "Decryption with wrong master key must throw CryptographicException");
+
+                // 2. Tamper with file on disk (flip byte in ciphertext) -> throws CryptographicException
+                var fileBytes = await File.ReadAllBytesAsync(files[0]);
+                fileBytes[^1] ^= 0xFF; // flip last byte
+                await File.WriteAllBytesAsync(files[0], fileBytes);
+
+                bool threwTamper = false;
+                try
+                {
+                    await storeA.GetSecretAsync(secretPath, default);
+                }
+                catch (System.Security.Cryptography.CryptographicException)
+                {
+                    threwTamper = true;
+                }
+                Assert(threwTamper, "Ciphertext or tag tampering must be detected and rejected by AES-GCM");
+            }
+            finally
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, true);
+                }
+            }
+        });
+
+        await RunAsyncTest("T90: SelfHost: OpenBaoHttpClient token redaction in error messages", async () =>
+        {
+            using var http = new HttpClient();
+            var sensitiveToken = "s.super-secret-vault-auth-token-xyz";
+            // Direct client targeting unreachable loopback port to trigger connection error
+            var client = new OpenBaoHttpClient(http, "http://127.0.0.1:54321", sensitiveToken);
+
+            bool threw = false;
+            try
+            {
+                await client.StoreSecretAsync("test/path", new Dictionary<string, string> { { "k", "v" } }, default);
+            }
+            catch (Exception ex)
+            {
+                threw = true;
+                Assert(!ex.ToString().Contains(sensitiveToken), "Vault auth token must be redacted from all exception messages");
+            }
+            Assert(threw, "Unreachable vault endpoint throws exception");
+        });
+
         Console.WriteLine("\n-------------------------------------------------");
         Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
         Console.WriteLine("-------------------------------------------------");

@@ -1,0 +1,45 @@
+[Unit]
+Description=MuniClaw Dedicated Worker Supervisor
+Documentation=https://github.com/municlaw/municlaw
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=municlaw
+Group=municlaw
+WorkingDirectory=/var/lib/municlaw
+
+# Load environment configuration file
+EnvironmentFile=-/etc/municlaw/worker.env
+
+# Standard runtime defaults
+Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
+Environment=DOTNET_NOLOGO=1
+Environment=MUNICLAW_TASKS_ROOT=/tmp/municlaw/tasks
+Environment=OPENCODE_EXECUTABLE_PATH=/usr/local/bin/opencode
+Environment=OPENCODE_HOST=127.0.0.1
+Environment=OPENCODE_PORT=4096
+
+# Launch worker runtime binary
+ExecStart=/usr/bin/dotnet /opt/municlaw/worker/MuniClaw.Worker.dll
+
+# Process lifecycle and recovery
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=30s
+
+# Resource and descriptor boundaries
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Sandboxing & security hardening
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/municlaw /tmp/municlaw
+PrivateTmp=false
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

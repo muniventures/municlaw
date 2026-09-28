@@ -1,0 +1,45 @@
+# Stage 1: Build & Publish
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+# Copy project files for caching layer
+COPY modules/core/MuniClaw.Core.csproj modules/core/
+COPY modules/api/MuniClaw.Api.csproj modules/api/
+
+# Restore dependencies
+RUN dotnet restore modules/api/MuniClaw.Api.csproj
+
+# Copy full source tree
+COPY modules/core/ modules/core/
+COPY modules/api/ modules/api/
+
+# Publish Release
+WORKDIR /src/modules/api
+RUN dotnet publish MuniClaw.Api.csproj -c Release -o /app/publish --no-restore
+
+# Stage 2: Runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+WORKDIR /app
+
+# Install curl for docker healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Provision storage and secret directories
+RUN mkdir -p /var/lib/municlaw/data /var/lib/municlaw/secrets && \
+    chmod 700 /var/lib/municlaw/secrets
+
+# Copy compiled artifacts
+COPY --from=build /app/publish .
+
+# Environment configuration
+ENV ASPNETCORE_URLS=http://+:5000 \
+    ASPNETCORE_ENVIRONMENT=Production \
+    DOTNET_RUNNING_IN_CONTAINER=true \
+    MUNICLAW_STORAGE_PATH=/var/lib/municlaw/data \
+    MUNICLAW_SECRET_PATH=/var/lib/municlaw/secrets
+
+EXPOSE 5000
+
+ENTRYPOINT ["dotnet", "MuniClaw.Api.dll"]

@@ -1,0 +1,44 @@
+# Stage 1: Build & Publish
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+# Copy project files for caching layer
+COPY modules/core/MuniClaw.Core.csproj modules/core/
+COPY modules/worker/MuniClaw.Worker.csproj modules/worker/
+
+# Restore dependencies
+RUN dotnet restore modules/worker/MuniClaw.Worker.csproj
+
+# Copy full source tree
+COPY modules/core/ modules/core/
+COPY modules/worker/ modules/worker/
+
+# Publish Release
+WORKDIR /src/modules/worker
+RUN dotnet publish MuniClaw.Worker.csproj -c Release -o /app/publish --no-restore
+
+# Stage 2: Runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+WORKDIR /app
+
+# Install required tools: git, curl, bash, ca-certificates, jq
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    curl \
+    git \
+    ca-certificates \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Provision sandbox and storage directories
+RUN mkdir -p /tmp/municlaw/tasks /var/lib/municlaw && \
+    chmod 1777 /tmp/municlaw/tasks
+
+# Copy compiled artifacts
+COPY --from=build /app/publish .
+
+# Environment configuration
+ENV MUNICLAW_TASKS_ROOT=/tmp/municlaw/tasks \
+    DOTNET_RUNNING_IN_CONTAINER=true
+
+ENTRYPOINT ["dotnet", "MuniClaw.Worker.dll"]
