@@ -1,0 +1,822 @@
+using MuniClaw.Core.Contracts.Approvals;
+using MuniClaw.Core.Contracts.Harness;
+using MuniClaw.Core.Contracts.Tasks;
+using MuniClaw.Core.Contracts.Worker;
+using MuniClaw.Core.Data;
+using MuniClaw.Core.Integrations;
+using MuniClaw.Core.Models;
+using MuniClaw.Core.Services;
+using TaskStatus = MuniClaw.Core.Contracts.Tasks.TaskStatus;
+
+namespace MuniClaw.Tests;
+
+public static class Program
+{
+    private static int _passed = 0;
+    private static int _failed = 0;
+
+    public static async Task<int> Main()
+    {
+        Console.WriteLine("=================================================");
+        Console.WriteLine("   MuniClaw Contract & Control-Plane Test Suite ");
+        Console.WriteLine("=================================================\n");
+
+        // --- T00 Contract Qualification Tests ---
+        RunTest("T00: TaskRunStateMachine: Valid standard lifecycle transitions", () =>
+        {
+            var transitions = new[]
+            {
+                (TaskRunStatus.Queued, TaskRunStatus.Preparing),
+                (TaskRunStatus.Preparing, TaskRunStatus.Running),
+                (TaskRunStatus.Running, TaskRunStatus.AwaitingInput),
+                (TaskRunStatus.AwaitingInput, TaskRunStatus.Running),
+                (TaskRunStatus.Running, TaskRunStatus.Completed),
+                (TaskRunStatus.Running, TaskRunStatus.Cancelling),
+                (TaskRunStatus.Cancelling, TaskRunStatus.Cancelled)
+            };
+
+            foreach (var (from, to) in transitions)
+            {
+                Assert(TaskRunStateTransitions.CanTransition(from, to), $"Expected CanTransition({from}, {to}) to be true");
+                TaskRunStateTransitions.ValidateTransition(from, to);
+            }
+        });
+
+        RunTest("T00: TaskRunStateMachine: Invalid transitions from terminal states", () =>
+        {
+            var invalidTransitions = new[]
+            {
+                (TaskRunStatus.Completed, TaskRunStatus.Running),
+                (TaskRunStatus.Completed, TaskRunStatus.Queued),
+                (TaskRunStatus.Failed, TaskRunStatus.Running),
+                (TaskRunStatus.Cancelled, TaskRunStatus.Running),
+                (TaskRunStatus.Queued, TaskRunStatus.Completed)
+            };
+
+            foreach (var (from, to) in invalidTransitions)
+            {
+                Assert(!TaskRunStateTransitions.CanTransition(from, to), $"Expected CanTransition({from}, {to}) to be false");
+                bool threw = false;
+                try { TaskRunStateTransitions.ValidateTransition(from, to); }
+                catch (InvalidOperationException) { threw = true; }
+                Assert(threw, $"Expected ValidateTransition({from}, {to}) to throw");
+            }
+        });
+
+        RunTest("T00: CapabilityPolicyEngine: PlatformDenied cannot be overridden to Allow", () =>
+        {
+            var defaultDeny = CapabilityPolicyEngine.GetDefaultSetting(CapabilityCategory.PlatformDenied);
+            Assert(defaultDeny == ApprovalPolicySetting.Deny, "PlatformDenied must default to Deny");
+
+            var forcedAllow = CapabilityPolicyEngine.Evaluate(CapabilityCategory.PlatformDenied, ApprovalPolicySetting.Allow);
+            Assert(forcedAllow == ApprovalPolicySetting.Deny, "PlatformDenied cannot be overridden to Allow");
+        });
+
+        RunTest("T00: TaskEvents: Monotonic cursor format and parser", () =>
+        {
+            var runId = Guid.NewGuid();
+            var evt = new TaskEventDto
+            {
+                EventId = Guid.NewGuid(),
+                TaskId = Guid.NewGuid(),
+                RunId = runId,
+                SequenceNumber = 77,
+                EventType = TaskEventType.StepStarted,
+                Timestamp = DateTimeOffset.UtcNow,
+                PayloadJson = "{}"
+            };
+
+            Assert(evt.Cursor == $"{runId}:77", $"Cursor mismatch: {evt.Cursor}");
+            var parsed = TaskEventDto.ParseCursor(evt.Cursor);
+            Assert(parsed.HasValue && parsed.Value.RunId == runId && parsed.Value.SequenceNumber == 77, "Cursor parse failed");
+        });
+
+        RunTest("T00: HarnessEventMapper: OpenCode v1.18.32 event mapping to canonical events", () =>
+        {
+            Assert(HarnessEventMapper.MapToCanonical("EventSessionNextStepStarted") == TaskEventType.StepStarted, "StepStarted mapping");
+            Assert(HarnessEventMapper.MapToCanonical("EventPermissionAsked") == TaskEventType.ApprovalRequested, "ApprovalRequested mapping");
+            Assert(HarnessEventMapper.MapToCanonical("EventSessionDiff") == TaskEventType.DiffUpdated, "DiffUpdated mapping");
+            Assert(HarnessEventMapper.MapToCanonical("Event.tui.toast.show") == null, "Transient event should filter");
+        });
+
+        // --- T10 Control Plane & Integrations Tests ---
+
+        await RunAsyncTest("T10: Authorization: Subject mapping, allowlisting, and MVP single-member rule", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+
+            // 1. Subject mapping
+            var user1 = await auth.GetOrCreateUserAsync("firebase:uid-1", "alice@example.com", default);
+            Assert(!user1.IsAllowlisted, "New user should not be allowlisted by default");
+
+            // 2. Allowlisting check
+            await auth.SetUserAllowlistedAsync(user1.Id, true, default);
+            Assert(await auth.IsUserAllowlistedAsync(user1.Id, default), "User should now be allowlisted");
+
+            var orgId = Guid.NewGuid();
+            store.Organizations[orgId] = new Organization { Id = orgId, Name = "Acme Corp", Slug = "acme" };
+
+            // 3. Add first member -> succeeds
+            var m1 = await auth.AddMemberToOrganizationAsync(orgId, user1.Id, MembershipRole.Admin, default);
+            Assert(m1.IsActive && m1.Role == MembershipRole.Admin, "First member should succeed as Admin");
+            Assert(await auth.CanAccessOrganizationAsync(user1.Id, orgId, default), "User 1 can access org");
+
+            // 4. Try adding second active member -> MUST FAIL under MVP single-member policy
+            var user2 = await auth.GetOrCreateUserAsync("firebase:uid-2", "bob@example.com", default);
+            await auth.SetUserAllowlistedAsync(user2.Id, true, default);
+
+            bool threw = false;
+            try
+            {
+                await auth.AddMemberToOrganizationAsync(orgId, user2.Id, MembershipRole.Member, default);
+            }
+            catch (InvalidOperationException)
+            {
+                threw = true;
+            }
+            Assert(threw, "Adding a second active member to an org must throw under MVP policy");
+        });
+
+        await RunAsyncTest("T10: TaskLifecycle: One-active-task rule, idempotency, and follow-up chaining", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            // 1. Create task 1
+            var req1 = new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Feature A",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Implement feature A",
+                HarnessVersion = "1.18.32"
+            };
+
+            var (task1, run1) = await lifecycle.CreateTaskAsync(req1, default);
+            Assert(run1.Status == TaskRunStatus.Queued, "Task run should be queued");
+            Assert(task1.TaskBranch.StartsWith("municlaw/task-"), "Dedicated task branch assigned");
+
+            // Idempotency: duplicate request returns existing
+            var (task1Dup, run1Dup) = await lifecycle.CreateTaskAsync(req1, default);
+            Assert(task1Dup.Id == task1.Id, "Duplicate title request must return existing task");
+
+            // Worker claims run 1 -> status transitions to Preparing
+            var claim1 = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(claim1.HasWork && claim1.RunId == run1.Id, "Worker claimed run 1");
+
+            // 2. Create task 2 in same org
+            var req2 = new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Feature B",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Implement feature B",
+                HarnessVersion = "1.18.32"
+            };
+            var (task2, run2) = await lifecycle.CreateTaskAsync(req2, default);
+
+            // 3. Worker tries to claim while run 1 is active -> MUST NOT claim task 2 (one executing task per org)
+            var claim2 = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = Guid.NewGuid(),
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(!claim2.HasWork, "Cannot claim work when another task is active in the same organization");
+
+            // 4. Complete run 1
+            run1.Status = TaskRunStatus.Completed;
+
+            // 5. Follow-up turn creates run 2 on task 1
+            var followUpRun = await lifecycle.CreateFollowUpRunAsync(task1.Id, userId, "Follow up instructions", default);
+            Assert(followUpRun.RunIndex == 2, "Follow up should have RunIndex 2");
+            Assert(followUpRun.Status == TaskRunStatus.Queued, "Follow up should be queued");
+        });
+
+        await RunAsyncTest("T10: WorkerDispatch: Fencing token, heartbeat commands, and lease expiration", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Fencing test task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Test worker fencing",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var workerId = Guid.NewGuid();
+            var claim = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = workerId,
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+
+            Assert(claim.HasWork, "Claim should succeed");
+            var fencingToken = claim.FencingToken;
+            var leaseToken = claim.LeaseToken!;
+
+            // Queue a command for the worker
+            await dispatch.QueueCommandAsync(run.Id, WorkerCommandType.Abort, "{}", default);
+
+            // Heartbeat with correct fencing token retrieves pending command
+            var hb = await dispatch.HeartbeatAsync(new WorkerHeartbeatRequest
+            {
+                WorkerId = workerId,
+                RunId = run.Id,
+                FencingToken = fencingToken,
+                CurrentLeaseToken = leaseToken,
+                LastAcknowledgedCommandCursor = 0
+            }, default);
+
+            Assert(hb.IsLeaseValid, "Lease should renew");
+            Assert(hb.PendingCommands.Count == 1, "Should deliver pending Abort command");
+            Assert(hb.PendingCommands[0].CommandType == WorkerCommandType.Abort, "Command type is Abort");
+
+            // Stale worker with wrong fencing token -> REJECTED
+            var staleHb = await dispatch.HeartbeatAsync(new WorkerHeartbeatRequest
+            {
+                WorkerId = workerId,
+                RunId = run.Id,
+                FencingToken = fencingToken - 1, // Stale!
+                CurrentLeaseToken = leaseToken,
+                LastAcknowledgedCommandCursor = 0
+            }, default);
+            Assert(!staleHb.IsLeaseValid, "Stale fencing token must be rejected");
+
+            // Event upload with valid fencing token -> succeeds
+            var ack = await dispatch.UploadEventsAsync(new WorkerEventBatchUpload
+            {
+                WorkerId = workerId,
+                RunId = run.Id,
+                FencingToken = fencingToken,
+                Events = new[]
+                {
+                    new TaskEventDto
+                    {
+                        EventId = Guid.NewGuid(),
+                        TaskId = task.Id,
+                        RunId = run.Id,
+                        SequenceNumber = 1,
+                        EventType = TaskEventType.StepStarted,
+                        Timestamp = DateTimeOffset.UtcNow,
+                        PayloadJson = "{\"step\":1}"
+                    }
+                }
+            }, default);
+            Assert(ack.LastAcknowledgedSequenceNumber == 1, "Event sequence 1 acked");
+
+            // Lease expiry reconciliation: expired lease marks run as Failed
+            run.LeaseExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5);
+            await dispatch.ReconcileExpiredLeasesAsync(default);
+            Assert(run.Status == TaskRunStatus.Failed, "Expired lease should reconcile to Failed");
+            Assert(run.LeaseToken == null, "Lease token must be invalidated");
+        });
+
+        await RunAsyncTest("T10: Approvals: Stale version rejection and PlatformDenied enforcement", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+            var dispatch = new WorkerDispatchService(store);
+            var approvals = new ApprovalService(store, auth, dispatch);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Approval test",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Review approval",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            // 1. Normal approval request (ExternalNetwork)
+            var req = await approvals.CreateApprovalRequestAsync(
+                run.Id, CapabilityCategory.ExternalNetwork, "Fetch api.vendor.com", "hash-v1", default);
+            Assert(req.Status == ApprovalRecordStatus.Pending, "Should be pending");
+            Assert(run.Status == TaskRunStatus.AwaitingInput, "Run should be awaiting input");
+
+            // 2. Stale approval submission with wrong version hash -> MUST FAIL
+            bool threwStale = false;
+            try
+            {
+                await approvals.SubmitDecisionAsync(req.Id, userId, ApprovalDecisionType.AllowOnce, "hash-stale-v0", default);
+            }
+            catch (InvalidOperationException)
+            {
+                threwStale = true;
+            }
+            Assert(threwStale, "Stale content version hash must be rejected");
+
+            // 3. Valid decision matching hash -> succeeds and resumes run
+            var approved = await approvals.SubmitDecisionAsync(req.Id, userId, ApprovalDecisionType.AllowOnce, "hash-v1", default);
+            Assert(approved.Status == ApprovalRecordStatus.Approved, "Should be approved");
+            Assert(run.Status == TaskRunStatus.Running, "Run should resume to Running");
+
+            // 4. PlatformDenied capability -> immediately auto-rejected
+            var deniedReq = await approvals.CreateApprovalRequestAsync(
+                run.Id, CapabilityCategory.PlatformDenied, "Mount docker.sock", "hash-v2", default);
+            Assert(deniedReq.Status == ApprovalRecordStatus.Rejected, "PlatformDenied must be immediately rejected");
+        });
+
+        await RunAsyncTest("T10: Credentials: Scope validation and revocation cascade", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var credService = new ProviderCredentialService(store, auth);
+            var lifecycle = new TaskLifecycleService(store, auth);
+
+            var (orgId, userId, projId, _) = await SetupOrgProjectAndCredential(store, auth);
+
+            // 1. Organization scope -> MUST FAIL in MVP
+            bool threwOrgScope = false;
+            try
+            {
+                await credService.RegisterCredentialAsync(new RegisterCredentialRequest
+                {
+                    OrganizationId = orgId,
+                    UserId = userId,
+                    ProviderName = "openai",
+                    Label = "Shared Key",
+                    Scope = CredentialScope.Organization, // NOT allowed in MVP
+                    ApiKey = "sk-org-key"
+                }, default);
+            }
+            catch (InvalidOperationException)
+            {
+                threwOrgScope = true;
+            }
+            Assert(threwOrgScope, "Organization-scoped keys must be rejected in MVP");
+
+            // 2. Personal scope -> succeeds and stores safe reference
+            var personalKey = await credService.RegisterCredentialAsync(new RegisterCredentialRequest
+            {
+                OrganizationId = orgId,
+                UserId = userId,
+                ProviderName = "anthropic",
+                Label = "Alice Anthropic",
+                Scope = CredentialScope.Personal,
+                ApiKey = "sk-ant-test"
+            }, default);
+            Assert(personalKey.Scope == CredentialScope.Personal, "Should be Personal");
+            Assert(personalKey.SecretReferencePath.Contains("orgs/" + orgId), "Scoped path in secret store");
+
+            // 3. Create run using this key, then revoke key -> run must immediately fail
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Revocation test",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = personalKey.Id,
+                Model = "claude-3-5-sonnet",
+                Instruction = "Coding task",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            run.Status = TaskRunStatus.Running; // simulate running
+            await credService.RevokeCredentialAsync(personalKey.Id, userId, default);
+            Assert(personalKey.IsRevoked, "Key should be revoked");
+            Assert(run.Status == TaskRunStatus.Failed, "Active run using revoked key must be terminated to Failed");
+        });
+
+        await RunAsyncTest("T10: Delivery: Reviewed commit binding and draft PR publication", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+            var gitClient = new MockGitProviderClient();
+            var deliveryService = new DeliveryService(store, auth, gitClient);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Delivery task",
+                BaseBranch = "main",
+                BaseCommitSha = "commit-base-0",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Do work",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            run.Status = TaskRunStatus.Completed; // terminal state required for delivery
+
+            var delivery = await deliveryService.PublishDraftAsync(new PublishDeliveryRequest
+            {
+                OrganizationId = orgId,
+                TaskId = task.Id,
+                RunId = run.Id,
+                UserId = userId,
+                BaseCommitSha = "commit-base-0",
+                ReviewedCommitSha = "commit-reviewed-1",
+                TargetBranch = "municlaw/feature-branch",
+                Title = "Draft PR: Completed Feature",
+                Body = "PR review notes"
+            }, default);
+
+            Assert(delivery.PublishedCommitSha == "commit-reviewed-1", "Published commit must match reviewed commit");
+            Assert(delivery.RemotePrUrl != null && delivery.RemotePrUrl.Contains("pull/42"), "Remote draft PR generated");
+        });
+
+        await RunAsyncTest("T10: Workspace: Explicit onboarding request and one-time token generation", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var infraClient = new MockMinicloudInfrastructureClient();
+            var workspaceService = new WorkspaceProvisioningService(store, auth, infraClient);
+
+            var (orgId, userId, _, _) = await SetupOrgProjectAndCredential(store, auth);
+
+            var (workspace, token) = await workspaceService.RequestWorkspaceAsync(orgId, userId, "us-east-1", default);
+            Assert(workspace.Status == WorkspaceStatus.Ready, "Workspace should be ready");
+            Assert(!string.IsNullOrEmpty(token), "One-time registration token should be returned");
+            Assert(workspace.SupervisorRegistrationTokenHash != null, "Token hash must be stored");
+        });
+
+        // --- T90 End-to-End Connected Qualification & Operational Scenarios ---
+
+        await RunAsyncTest("T90: E2E: Complete coding task lifecycle with SSE reconnect, approval, and draft PR", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+            var dispatch = new WorkerDispatchService(store);
+            var approvals = new ApprovalService(store, auth, dispatch);
+            var gitClient = new MockGitProviderClient();
+            var deliveryService = new DeliveryService(store, auth, gitClient);
+            var infraClient = new MockMinicloudInfrastructureClient();
+            var workspaceService = new WorkspaceProvisioningService(store, auth, infraClient);
+
+            // Step 1: User allowlist & dedicated workspace provisioning
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            var (workspace, regToken) = await workspaceService.RequestWorkspaceAsync(orgId, userId, "us-east-1", default);
+            Assert(workspace.Status == WorkspaceStatus.Ready && !string.IsNullOrEmpty(regToken), "Workspace provisioned");
+
+            // Step 2: User assigns task
+            var (task, run1) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Implement OAuth PKCE",
+                BaseBranch = "main",
+                BaseCommitSha = "sha-base-001",
+                ProviderCredentialReferenceId = credId,
+                Model = "claude-3-7-sonnet",
+                Instruction = "Implement secure PKCE token exchange",
+                HarnessVersion = "1.18.32"
+            }, default);
+            Assert(run1.Status == TaskRunStatus.Queued, "Task 1 queued");
+
+            // Step 3: Supervisor claims task via long-polling
+            var workerId = Guid.NewGuid();
+            var claim = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = workerId,
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+            Assert(claim.HasWork && claim.RunId == run1.Id, "Task claimed by supervisor");
+            var fencingToken = claim.FencingToken;
+
+            // Step 4: Supervisor streams events
+            await dispatch.UploadEventsAsync(new WorkerEventBatchUpload
+            {
+                WorkerId = workerId,
+                RunId = run1.Id,
+                FencingToken = fencingToken,
+                Events = new[]
+                {
+                    new TaskEventDto
+                    {
+                        EventId = Guid.NewGuid(), TaskId = task.Id, RunId = run1.Id,
+                        SequenceNumber = 1, EventType = TaskEventType.StepStarted,
+                        Timestamp = DateTimeOffset.UtcNow, PayloadJson = "{\"step\":1}"
+                    },
+                    new TaskEventDto
+                    {
+                        EventId = Guid.NewGuid(), TaskId = task.Id, RunId = run1.Id,
+                        SequenceNumber = 2, EventType = TaskEventType.TextDelta,
+                        Timestamp = DateTimeOffset.UtcNow, PayloadJson = "{\"text\":\"Analyzing PKCE flow...\"}"
+                    }
+                }
+            }, default);
+
+            // Step 5: Browser SSE replay: reconnects with sinceSequence = 1, receives only sequence 2 (no duplicates)
+            var replayedEvents = await dispatch.GetEventsSinceAsync(run1.Id, 1, default);
+            Assert(replayedEvents.Count == 1 && replayedEvents[0].SequenceNumber == 2, "SSE replay cursor verified");
+
+            // Step 6: Approval workflow
+            var appReq = await approvals.CreateApprovalRequestAsync(
+                run1.Id, CapabilityCategory.ExternalNetwork, "Connect to oauth.gitlab.com", "v1-hash", default);
+            Assert(run1.Status == TaskRunStatus.AwaitingInput, "Run awaiting approval");
+
+            var appDecision = await approvals.SubmitDecisionAsync(appReq.Id, userId, ApprovalDecisionType.AllowOnce, "v1-hash", default);
+            Assert(appDecision.Status == ApprovalRecordStatus.Approved, "Approval granted");
+            Assert(run1.Status == TaskRunStatus.Running, "Run resumed to running");
+
+            // Step 7: Tool finishes, task completes
+            run1.Status = TaskRunStatus.Completed;
+
+            // Step 8: Delivery publication bound to reviewed commit
+            var delivery = await deliveryService.PublishDraftAsync(new PublishDeliveryRequest
+            {
+                OrganizationId = orgId,
+                TaskId = task.Id,
+                RunId = run1.Id,
+                UserId = userId,
+                BaseCommitSha = "sha-base-001",
+                ReviewedCommitSha = "sha-reviewed-002",
+                TargetBranch = task.TaskBranch,
+                Title = "Draft PR: OAuth PKCE Implementation",
+                Body = "Automated PR created by MuniClaw"
+            }, default);
+            Assert(delivery.RemotePrUrl != null && delivery.RemotePrUrl.Contains("pull/42"), "Draft PR published");
+
+            // Step 9: Follow-up turn creates Run 2 on the same task branch
+            var run2 = await lifecycle.CreateFollowUpRunAsync(task.Id, userId, "Add unit tests for PKCE exchange", default);
+            Assert(run2.RunIndex == 2 && run2.TaskId == task.Id, "Follow-up run appended");
+            Assert(run2.Status == TaskRunStatus.Queued, "Follow-up queued for worker claim");
+        });
+
+        await RunAsyncTest("T90: Security: Cross-tenant isolation blocks unauthorized organization access", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+
+            var (orgA, userA, projA, credA) = await SetupOrgProjectAndCredential(store, auth);
+
+            // User B in Org B
+            var userB = await auth.GetOrCreateUserAsync("firebase:uid-b", "bob@external.com", default);
+            await auth.SetUserAllowlistedAsync(userB.Id, true, default);
+            var orgB = Guid.NewGuid();
+            store.Organizations[orgB] = new Organization { Id = orgB, Name = "Org B", Slug = "org-b" };
+            await auth.AddMemberToOrganizationAsync(orgB, userB.Id, MembershipRole.Admin, default);
+
+            // User B attempts to create task in Org A -> REJECTED
+            bool threwCrossTenant = false;
+            try
+            {
+                await lifecycle.CreateTaskAsync(new CreateTaskRequest
+                {
+                    OrganizationId = orgA,
+                    ProjectId = projA,
+                    UserId = userB.Id, // Unauthorized!
+                    Title = "Malicious Task",
+                    BaseBranch = "main",
+                    ProviderCredentialReferenceId = credA,
+                    Model = "gpt-4o",
+                    Instruction = "Cross-tenant intrusion",
+                    HarnessVersion = "1.18.32"
+                }, default);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                threwCrossTenant = true;
+            }
+            Assert(threwCrossTenant, "Cross-organization task creation must be blocked with 403 Unauthorized");
+        });
+
+        await RunAsyncTest("T90: Security: Sandbox defense blocks Docker socket, cloud metadata, and traversal", async () =>
+        {
+            var taskId = Guid.NewGuid();
+            var sandboxBase = "/tmp/municlaw/tasks/" + taskId;
+            var worktree = sandboxBase + "/worktree";
+
+            // 1. Docker socket mount attack -> Throws UnauthorizedAccessException
+            bool threwDocker = false;
+            try { MuniClaw.Worker.Sandbox.SandboxPolicyEnforcer.ValidatePathAccess(sandboxBase, "/var/run/docker.sock"); }
+            catch (UnauthorizedAccessException) { threwDocker = true; }
+            Assert(threwDocker, "Host Docker socket access must be denied");
+
+            // 2. Directory traversal attack -> Throws UnauthorizedAccessException
+            bool threwTraversal = false;
+            try { MuniClaw.Worker.Sandbox.SandboxPolicyEnforcer.ValidatePathAccess(sandboxBase, worktree + "/../../../etc/shadow"); }
+            catch (UnauthorizedAccessException) { threwTraversal = true; }
+            Assert(threwTraversal, "Traversal outside sandbox must be denied");
+
+            // 3. Link-local cloud metadata attack -> Throws UnauthorizedAccessException
+            bool threwMetadata = false;
+            try { MuniClaw.Worker.Sandbox.SandboxPolicyEnforcer.ValidateNetworkTarget("169.254.169.254"); }
+            catch (UnauthorizedAccessException) { threwMetadata = true; }
+            Assert(threwMetadata, "AWS/GCP/Azure link-local metadata must be denied");
+
+            bool threwSubnet = false;
+            try { MuniClaw.Worker.Sandbox.SandboxPolicyEnforcer.ValidateNetworkTarget("169.254.1.1"); }
+            catch (UnauthorizedAccessException) { threwSubnet = true; }
+            Assert(threwSubnet, "Link-local subnet must be denied");
+
+            // 4. Safe worktree file -> Succeeds without throwing
+            MuniClaw.Worker.Sandbox.SandboxPolicyEnforcer.ValidatePathAccess(sandboxBase, worktree + "/src/App.cs");
+
+            // 5. Allowed package repository -> Succeeds without throwing
+            MuniClaw.Worker.Sandbox.SandboxPolicyEnforcer.ValidateNetworkTarget("registry.npmjs.org");
+
+            await Task.CompletedTask;
+        });
+
+        await RunAsyncTest("T90: Fault Tolerance: Expired lease prevents split-brain and rejects stale uploads", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var lifecycle = new TaskLifecycleService(store, auth);
+            var dispatch = new WorkerDispatchService(store);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Fault tolerance task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Test fault recovery",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var workerId = Guid.NewGuid();
+            var claim = await dispatch.ClaimWorkAsync(new WorkerClaimRequest
+            {
+                WorkerId = workerId,
+                OrganizationId = orgId,
+                SupportedHarnessVersion = "1.18.32"
+            }, default);
+
+            var oldFencingToken = claim.FencingToken;
+            var oldLeaseToken = claim.LeaseToken!;
+
+            // Worker heartbeat expires
+            run.LeaseExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(-10);
+            await dispatch.ReconcileExpiredLeasesAsync(default);
+            Assert(run.Status == TaskRunStatus.Failed, "Run reconciled to Failed");
+            Assert(run.LeaseToken == null, "Lease revoked");
+
+            // Old worker tries to send heartbeat -> REJECTED
+            var hb = await dispatch.HeartbeatAsync(new WorkerHeartbeatRequest
+            {
+                WorkerId = workerId,
+                RunId = run.Id,
+                FencingToken = oldFencingToken,
+                CurrentLeaseToken = oldLeaseToken,
+                LastAcknowledgedCommandCursor = 0
+            }, default);
+            Assert(!hb.IsLeaseValid, "Expired worker heartbeat rejected");
+
+            // Old worker tries to upload events -> REJECTED with fencing conflict
+            // Increment fencing token to simulate new epoch
+            run.FencingToken = oldFencingToken + 1;
+            bool threwFencing = false;
+            try
+            {
+                await dispatch.UploadEventsAsync(new WorkerEventBatchUpload
+                {
+                    WorkerId = workerId,
+                    RunId = run.Id,
+                    FencingToken = oldFencingToken, // Stale!
+                    Events = Array.Empty<TaskEventDto>()
+                }, default);
+            }
+            catch (InvalidOperationException)
+            {
+                threwFencing = true;
+            }
+            Assert(threwFencing, "Stale worker upload must be rejected to prevent split-brain");
+        });
+
+        Console.WriteLine("\n-------------------------------------------------");
+        Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
+        Console.WriteLine("-------------------------------------------------");
+
+        return _failed > 0 ? 1 : 0;
+    }
+
+    private static async Task<(Guid orgId, Guid userId, Guid projId, Guid credId)> SetupOrgProjectAndCredential(
+        IMuniClawStore store,
+        IOrganizationAuthorizationService auth)
+    {
+        var user = await auth.GetOrCreateUserAsync("firebase:uid-test", "test@muni.dev", default);
+        await auth.SetUserAllowlistedAsync(user.Id, true, default);
+
+        var orgId = Guid.NewGuid();
+        store.Organizations[orgId] = new Organization { Id = orgId, Name = "Test Org", Slug = "test-org" };
+        await auth.AddMemberToOrganizationAsync(orgId, user.Id, MembershipRole.Admin, default);
+
+        var repoId = Guid.NewGuid();
+        store.RepositoryConnections[repoId] = new RepositoryConnection
+        {
+            Id = repoId,
+            OrganizationId = orgId,
+            GitHost = GitHostType.GitHub,
+            ExternalAccountId = "gh-acc-1",
+            RepositoryId = "12345",
+            RepositoryFullName = "muniventures/test-repo",
+            DefaultBranch = "main",
+            SecretReferencePath = "secret/repo"
+        };
+
+        var projId = Guid.NewGuid();
+        store.Projects[projId] = new Project
+        {
+            Id = projId,
+            OrganizationId = orgId,
+            RepositoryConnectionId = repoId,
+            Name = "Core Project",
+            DefaultBaseBranch = "main"
+        };
+
+        var credId = Guid.NewGuid();
+        store.ProviderCredentials[credId] = new ProviderCredentialReference
+        {
+            Id = credId,
+            OrganizationId = orgId,
+            OwningUserId = user.Id,
+            ProviderName = "openai",
+            Label = "Test Key",
+            Scope = CredentialScope.Personal,
+            SecretReferencePath = "secret/test-key",
+            IsRevoked = false
+        };
+
+        return (orgId, user.Id, projId, credId);
+    }
+
+    private static void RunTest(string testName, Action testAction)
+    {
+        try
+        {
+            testAction();
+            Console.WriteLine($"[PASS] {testName}");
+            _passed++;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FAIL] {testName}: {ex.Message}");
+            _failed++;
+        }
+    }
+
+    private static async Task RunAsyncTest(string testName, Func<Task> testAction)
+    {
+        try
+        {
+            await testAction();
+            Console.WriteLine($"[PASS] {testName}");
+            _passed++;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FAIL] {testName}: {ex.Message}");
+            _failed++;
+        }
+    }
+
+    private static void Assert(bool condition, string message)
+    {
+        if (!condition)
+        {
+            throw new Exception(message);
+        }
+    }
+}
