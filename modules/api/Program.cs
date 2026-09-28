@@ -17,6 +17,9 @@ builder.Services.AddScoped<IProviderCredentialService, ProviderCredentialService
 builder.Services.AddScoped<IWorkspaceProvisioningService, WorkspaceProvisioningService>();
 builder.Services.AddScoped<IMinicloudInfrastructureClient, MockMinicloudInfrastructureClient>();
 builder.Services.AddScoped<IGitProviderClient, MockGitProviderClient>();
+builder.Services.AddSingleton<IPreviewDeploymentClient, MinicloudPreviewDeploymentClient>();
+builder.Services.AddScoped<IPreviewDeploymentService, PreviewDeploymentService>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
 
 builder.Services.AddControllers();
 builder.Services.AddCors(options =>

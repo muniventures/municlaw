@@ -24,6 +24,7 @@ import { ApprovalBanner } from "./components/ApprovalBanner";
 import { DeliveryModal } from "./components/DeliveryModal";
 import { UsageCard } from "./components/UsageCard";
 import { FollowUpInput } from "./components/FollowUpInput";
+import { PreviewDeploymentCard } from "./components/PreviewDeploymentCard";
 
 import {
   getTask,
@@ -368,6 +369,12 @@ export function TaskDetailModule() {
           ))}
         </div>
       )}
+
+      {/* Preview Deployment Environment */}
+      <PreviewDeploymentCard
+        taskId={task.id}
+        branchName={task.taskBranch}
+      />
 
       {/* Main Tabs Layout */}
       <Tabs value={activeTab} onValueChange={setActiveTab}>

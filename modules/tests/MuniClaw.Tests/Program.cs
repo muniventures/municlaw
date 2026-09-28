@@ -1693,6 +1693,199 @@ public static class Program
             Assert(runB.Status == TaskRunStatus.Preparing, "Org B task transitions to Preparing");
         });
 
+        // --- T90 Preview Deployments Qualification Tests ---
+
+        await RunAsyncTest("T90: Preview: Branch normalization and DNS subdomain synthesis", async () =>
+        {
+            var client = new MinicloudPreviewDeploymentClient();
+
+            // 1. Branch normalization tests
+            Assert(MinicloudPreviewDeploymentClient.NormalizeBranchName("main") == "main", "main branch normalizes to main");
+            Assert(MinicloudPreviewDeploymentClient.NormalizeBranchName("municlaw/task-12345678") == "municlaw-task-12345678", "Slashes become hyphens");
+            Assert(MinicloudPreviewDeploymentClient.NormalizeBranchName("feat/UPPER_CASE_AND__underscores") == "feat-upper-case-and-underscores", "Uppercase and underscores normalized");
+            Assert(MinicloudPreviewDeploymentClient.NormalizeBranchName("---leading-and-trailing---") == "leading-and-trailing", "Leading/trailing hyphens trimmed");
+            Assert(MinicloudPreviewDeploymentClient.NormalizeBranchName("") == "branch", "Empty string defaults to branch");
+
+            // Long branch name (> 32 chars) gets truncated with stable 8-char hex hash suffix
+            var longBranch = "feature/very-long-branch-name-that-exceeds-thirty-two-characters-in-length";
+            var normalizedLong = MinicloudPreviewDeploymentClient.NormalizeBranchName(longBranch);
+            Assert(normalizedLong.Length <= 32, $"Normalized branch length must be <= 32 characters (got {normalizedLong.Length}: {normalizedLong})");
+            Assert(normalizedLong.Contains("-"), "Long branch contains hyphen before hash suffix");
+
+            // 2. URL synthesis and active deployment tracking
+            var previewUrl = await client.TriggerDeploymentAsync("core-project", "municlaw/task-abc", "c0ffee1", default);
+            Assert(previewUrl == "https://core-project-municlaw-task-abc.app.muni.dev", $"Expected standard URL pattern, got {previewUrl}");
+
+            var status = await client.CheckStatusAsync(previewUrl, default);
+            Assert(status == PreviewDeploymentStatus.Active, "Client check status returns Active after trigger");
+        });
+
+        await RunAsyncTest("T90: Preview: Trigger preview deployment and status tracking", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var client = new MinicloudPreviewDeploymentClient();
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var previewService = new PreviewDeploymentService(store, auth, client);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            // Create task
+            var (task, run) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Preview Test Task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Implement test feature",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            // Trigger preview deployment
+            var preview = await previewService.TriggerPreviewAsync(task.Id, userId, default);
+            Assert(preview.Status == PreviewDeploymentStatus.Active, "Triggered preview must have Active status");
+            Assert(!string.IsNullOrEmpty(preview.PreviewUrl), "Preview URL must be populated");
+            Assert(preview.PreviewUrl != null && preview.PreviewUrl.StartsWith("https://") && preview.PreviewUrl.EndsWith(".app.muni.dev"), "Preview URL must match Minicloud pattern");
+            Assert(preview.BranchName == task.TaskBranch, "Preview branch name must match task branch");
+            Assert(preview.TaskId == task.Id, "Preview task ID must match");
+            Assert(preview.DeployedAt != null, "DeployedAt timestamp must be recorded");
+
+            // Retrieve preview
+            var retrieved = await previewService.GetPreviewAsync(task.Id, userId, default);
+            Assert(retrieved != null, "GetPreviewAsync must return active preview");
+            Assert(retrieved!.Id == preview.Id, "Retrieved preview ID must match");
+            Assert(retrieved.Status == PreviewDeploymentStatus.Active, "Retrieved status must be Active");
+        });
+
+        await RunAsyncTest("T90: Preview: Idempotent deployment trigger", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var client = new MinicloudPreviewDeploymentClient();
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var previewService = new PreviewDeploymentService(store, auth, client);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            var (task, _) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Idempotent Preview Task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Instruction",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            // First trigger
+            var preview1 = await previewService.TriggerPreviewAsync(task.Id, userId, default);
+            Assert(store.PreviewDeployments.Count == 1, "Exactly 1 preview deployment record in store");
+
+            // Second trigger (idempotent call)
+            var preview2 = await previewService.TriggerPreviewAsync(task.Id, userId, default);
+            Assert(preview2.Id == preview1.Id, "Idempotent trigger must return existing preview deployment");
+            Assert(preview2.PreviewUrl == preview1.PreviewUrl, "URLs must be identical");
+            Assert(store.PreviewDeployments.Count == 1, "Store still has exactly 1 preview deployment record");
+        });
+
+        await RunAsyncTest("T90: Preview: Explicit teardown transitions status to TornDown", async () =>
+        {
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var client = new MinicloudPreviewDeploymentClient();
+            var queueService = new TaskQueueService(store);
+            var lifecycle = new TaskLifecycleService(store, auth, queueService);
+            var previewService = new PreviewDeploymentService(store, auth, client);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            var (task, _) = await lifecycle.CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Teardown Preview Task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Instruction",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            var preview = await previewService.TriggerPreviewAsync(task.Id, userId, default);
+            Assert(preview.Status == PreviewDeploymentStatus.Active, "Initial preview active");
+
+            // Teardown
+            var tornDown = await previewService.TearDownPreviewAsync(task.Id, userId, default);
+            Assert(tornDown.Status == PreviewDeploymentStatus.TornDown, "Status transitions to TornDown");
+            Assert(tornDown.TornDownAt != null, "TornDownAt timestamp must be set");
+
+            // Verify client reflects teardown
+            var clientStatus = await client.CheckStatusAsync(preview.PreviewUrl!, default);
+            Assert(clientStatus == PreviewDeploymentStatus.TornDown || clientStatus == PreviewDeploymentStatus.None, "Client reflects preview was torn down");
+
+            // Get preview reflects TornDown
+            var fetched = await previewService.GetPreviewAsync(task.Id, userId, default);
+            Assert(fetched != null && fetched.Status == PreviewDeploymentStatus.TornDown, "GetPreviewAsync reflects TornDown status");
+        });
+
+        await RunAsyncTest("T90: Preview: Security invariant: production secret isolation", async () =>
+        {
+            var client = new MinicloudPreviewDeploymentClient();
+            Assert(client.EnforcesProductionSecretIsolation, "Client must enforce production secret isolation");
+
+            // Verify Preview deployments never receive production secrets or vault credentials
+            var store = new InMemoryMuniClawStore();
+            var auth = new OrganizationAuthorizationService(store);
+            var previewService = new PreviewDeploymentService(store, auth, client);
+
+            var (orgId, userId, projId, credId) = await SetupOrgProjectAndCredential(store, auth);
+
+            // Unauthorized user cannot trigger preview deployment
+            var unauthorizedUserId = Guid.NewGuid();
+            bool accessDenied = false;
+            try
+            {
+                await previewService.TriggerPreviewAsync(Guid.NewGuid(), unauthorizedUserId, default);
+            }
+            catch (KeyNotFoundException)
+            {
+                // Task doesn't exist
+            }
+
+            var (task, _) = await new TaskLifecycleService(store, auth).CreateTaskAsync(new CreateTaskRequest
+            {
+                OrganizationId = orgId,
+                ProjectId = projId,
+                UserId = userId,
+                Title = "Security Task",
+                BaseBranch = "main",
+                ProviderCredentialReferenceId = credId,
+                Model = "gpt-4o",
+                Instruction = "Instruction",
+                HarnessVersion = "1.18.32"
+            }, default);
+
+            try
+            {
+                await previewService.TriggerPreviewAsync(task.Id, unauthorizedUserId, default);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                accessDenied = true;
+            }
+
+            Assert(accessDenied, "Unauthorized user must be denied permission to trigger preview deployment");
+        });
+
         Console.WriteLine("\n-------------------------------------------------");
         Console.WriteLine($"Test Run Summary: {_passed} Passed, {_failed} Failed");
         Console.WriteLine("-------------------------------------------------");

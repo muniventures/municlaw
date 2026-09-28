@@ -326,3 +326,25 @@ export interface UpdateNotificationChannelRequest {
   signingSecret?: string;
 }
 
+// Preview Deployments
+export type PreviewDeploymentStatus =
+  | "None"
+  | "Deploying"
+  | "Active"
+  | "Failed"
+  | "TornDown";
+
+export interface PreviewDeployment {
+  id: string;
+  taskId: string;
+  runId: string;
+  branchName: string;
+  normalizedBranch: string;
+  commitSha?: string | null;
+  previewUrl?: string | null;
+  status: PreviewDeploymentStatus;
+  createdAt: string;
+  deployedAt?: string | null;
+  errorMessage?: string | null;
+}
+

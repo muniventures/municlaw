@@ -19,6 +19,7 @@ public interface IMuniClawStore
     ConcurrentDictionary<Guid, DeliveryRecord> Deliveries { get; }
     ConcurrentDictionary<Guid, UsageRecordEntity> UsageRecords { get; }
     ConcurrentDictionary<Guid, NotificationChannel> NotificationChannels { get; }
+    ConcurrentDictionary<Guid, PreviewDeployment> PreviewDeployments { get; }
 
     void StoreOrganizationCredential(ProviderCredentialReference credential);
     IReadOnlyList<ProviderCredentialReference> GetOrganizationCredentials(Guid organizationId);
@@ -48,6 +49,7 @@ public sealed class InMemoryMuniClawStore : IMuniClawStore
     public ConcurrentDictionary<Guid, DeliveryRecord> Deliveries { get; } = new();
     public ConcurrentDictionary<Guid, UsageRecordEntity> UsageRecords { get; } = new();
     public ConcurrentDictionary<Guid, NotificationChannel> NotificationChannels { get; } = new();
+    public ConcurrentDictionary<Guid, PreviewDeployment> PreviewDeployments { get; } = new();
 
     public void StoreOrganizationCredential(ProviderCredentialReference credential)
     {
@@ -134,6 +136,7 @@ public sealed class InMemoryMuniClawStore : IMuniClawStore
         Deliveries.Clear();
         UsageRecords.Clear();
         NotificationChannels.Clear();
+        PreviewDeployments.Clear();
     }
 }
 

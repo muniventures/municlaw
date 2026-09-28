@@ -35,6 +35,7 @@ public sealed class MuniClawFileStore : IMuniClawStore
     public ConcurrentDictionary<Guid, DeliveryRecord> Deliveries { get; } = new();
     public ConcurrentDictionary<Guid, UsageRecordEntity> UsageRecords { get; } = new();
     public ConcurrentDictionary<Guid, NotificationChannel> NotificationChannels { get; } = new();
+    public ConcurrentDictionary<Guid, PreviewDeployment> PreviewDeployments { get; } = new();
 
     public MuniClawFileStore(string dataDirectoryPath)
     {
@@ -71,7 +72,8 @@ public sealed class MuniClawFileStore : IMuniClawStore
                 ApprovalRequests = ApprovalRequests.Values.ToList(),
                 Deliveries = Deliveries.Values.ToList(),
                 UsageRecords = UsageRecords.Values.ToList(),
-                NotificationChannels = NotificationChannels.Values.ToList()
+                NotificationChannels = NotificationChannels.Values.ToList(),
+                PreviewDeployments = PreviewDeployments.Values.ToList()
             };
 
             var json = JsonSerializer.Serialize(snapshot, JsonOptions);
@@ -160,6 +162,9 @@ public sealed class MuniClawFileStore : IMuniClawStore
 
             NotificationChannels.Clear();
             foreach (var nc in data.NotificationChannels) NotificationChannels[nc.Id] = nc;
+
+            PreviewDeployments.Clear();
+            foreach (var p in data.PreviewDeployments) PreviewDeployments[p.Id] = p;
         }
     }
 
@@ -267,6 +272,7 @@ public sealed class MuniClawFileStore : IMuniClawStore
             Deliveries.Clear();
             UsageRecords.Clear();
             NotificationChannels.Clear();
+            PreviewDeployments.Clear();
             SaveSnapshot();
         }
     }
@@ -287,5 +293,6 @@ public sealed class MuniClawFileStore : IMuniClawStore
         public List<DeliveryRecord> Deliveries { get; set; } = [];
         public List<UsageRecordEntity> UsageRecords { get; set; } = [];
         public List<NotificationChannel> NotificationChannels { get; set; } = [];
+        public List<PreviewDeployment> PreviewDeployments { get; set; } = [];
     }
 }
