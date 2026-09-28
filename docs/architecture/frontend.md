@@ -15,7 +15,7 @@ app/
   components/ui/         shadcn primitives
 ```
 
-Use React 19, TypeScript, React Router 7, Vite, shadcn/ui and lucide-react. Adopt the neighboring projects' route -> module -> component pattern, without copying private application code. API configuration and task event reconnection have shared owners. Feature modules use the shared client rather than raw duplicated fetch/auth logic.
+Use React 19, TypeScript, React Router 7, Vite, shadcn/ui and lucide-react. Adopt the neighboring projects' route -> module -> component pattern, without copying private application code. API configuration and task event reconnection have shared owners. Task activity uses one SSE connection owner with cursor replay and deduplication. Feature modules use the shared client rather than raw duplicated fetch/auth logic.
 
 Navigation: Tasks, Projects, Connections, Workspace, Settings. Responsive web is MVP; native mobile and messaging are later. Show actual test evidence, unknown usage, offline workers, and stale approvals accurately. Do not ship fake successful agent activity.
 

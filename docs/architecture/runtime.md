@@ -2,7 +2,7 @@
 
 Target runtime: one dedicated coding VPS per organization, managed by Minicloud and separate from production application hosts.
 
-The trusted worker connects outbound to the MuniClaw API using a revocable scoped identity. It supervises one active task at a time in the MVP. Each task has a separate sandbox, worktree, home and OpenCode state. OpenCode runs as an unprivileged pinned headless dependency reachable only by the supervisor.
+The trusted worker connects outbound to the MuniClaw API using a revocable scoped identity. It claims work through authenticated HTTP long-polling and maintains ownership with leases, fencing tokens and heartbeats. Heartbeat responses carry commands after a durable cursor; bounded event/result uploads are idempotent and acknowledged. It supervises one active task at a time in the MVP. Each task has a separate sandbox, worktree, home and OpenCode state. OpenCode runs as an unprivileged pinned headless dependency reachable only by the supervisor.
 
 Enforce filesystem/network/resource boundaries outside repository-controlled configuration. Never expose host Docker sockets, control-plane database access, or Minicloud administrative credentials. Isolated build support must be qualified separately.
 

@@ -6,6 +6,7 @@ Target requirements, not implemented guarantees.
 - Keep platform authority outside untrusted repositories and harness configuration. Sandbox filesystem, network, processes and resources independently of model instructions.
 - Store credentials only in a scoped secret store; never in git, database events, prompts, logs or browser responses. Separate supervisor credentials from the coding sandbox.
 - Bind approvals to actor, run, action and content version. Recheck membership before executing. Reject stale approvals.
+- Represent approval policy with stable capability categories and `allow`, `ask`, or `deny`. Users may configure policy within platform limits, but cannot override hard denials for host/infrastructure access, metadata services, host Docker, raw provider credentials, production secrets or deployment.
 - Default delivery requires review; no automatic merge, force push or production deployment.
 - Separate coding VPSes from production. Block infrastructure metadata and management networks; do not mount host Docker sockets.
 - Record metadata-only audit evidence. Use finite retention and explicit workspace deletion semantics.
